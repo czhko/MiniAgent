@@ -1,0 +1,56 @@
+{
+  "label": "测试",
+  "display_name": "MiniAgent测试",
+  "enabled": false,
+  "side_paths": [
+    {
+      "label": "示例旁路1",
+      "type": "agent",
+      "route": "",
+      "model": "",
+      "system_prompt": "",
+      "user_injection": "{user_text}",
+      "thinking": "off",
+      "mock_content": "<think>thinking4 example</think>\ntext example output1\n<think>thinking5 example</think>\ntext example output2\n<think>thinking6 example</think>\ntext example output3",
+      "context_output": {
+        "tool_use": true,
+        "tool_result": true,
+        "think": true,
+        "text": true
+      }
+    },
+    {
+      "label": "新旁路",
+      "type": "agent",
+      "route": "",
+      "model": "",
+      "system_prompt": "",
+      "user_injection": "{user_text}",
+      "thinking": "off",
+      "mock_content": "{user_text}\n{side0}",
+      "context_output": {
+        "tool_use": true,
+        "tool_result": true,
+        "think": true,
+        "text": true
+      }
+    }
+  ],
+  "main_path": {
+    "route": "",
+    "model": "mock",
+    "system_prompt": "",
+    "user_injection": "{user_text}",
+    "thinking": "off",
+    "context_output": {
+      "tool_use": true,
+      "tool_result": true,
+      "think": true,
+      "text": true
+    }
+  },
+  "variables": {},
+  "mock_content": "PYTHONIOENCODING=utf-8 python \n绝对路径\n\n\n<think>thinking1 example</think>\n<think>thinkinga example</think>\n<think>thinkingb example</think>\n<think>thinkingc example</think>\n<think>thinkingd example</think>\ntext1 example output\n<think>thinking2 example</think>\ntext2 example output\n<think>thinking3 example</think>\ntext3 example output",
+  "separator": "",
+  "keep_turns": -1
+}
