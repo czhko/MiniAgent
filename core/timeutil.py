@@ -10,5 +10,5 @@ def bj_now() -> datetime:
 
 
 def bj_epoch() -> float:
-    """Current epoch seconds (Beijing-time-aligned). Same value as bj_epoch()."""
+    """Current epoch seconds (Beijing-time-aligned)."""
     return datetime.now(BJ_TZ).timestamp()

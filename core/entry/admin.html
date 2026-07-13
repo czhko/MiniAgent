@@ -457,6 +457,7 @@
   /* round summary card */
   .round-summary { font-size:12px; padding:4px 8px; margin:2px 0; background:rgba(0,0,0,0.02); border-radius:6px; }
 </style>
+<script src="/admin/marked.min.js"></script>
 </head>
 <body>
 
@@ -469,7 +470,7 @@
 <!-- header -->
 <div class="header">
   <div class="header-logo">MiniAgent</div>
-  <div class="header-ver" id="headerVer">v0.4.3</div>
+  <div class="header-ver" id="headerVer">v0.4.4</div>
 </div>
 
 <!-- tabs -->
@@ -555,13 +556,51 @@
 
     <div class="panel">
       <div class="panel-header">
-        <span class="panel-title">看图模型 (DescribeImage)</span><button class="help-btn" onclick="showHelp('看图模型','DescribeImage 工具使用的视觉模型。默认 GLM-4V-Flash(免费)→失败回退 GLM-4.6V。API 用完可在这里换模型。勾选代理则通过总代理地址访问',event)">?</button>
+        <span class="panel-title">Tavily 搜索</span><button class="help-btn" onclick="showHelp('Tavily 搜索','Tavily 是 AI 专用搜索引擎。WebSearch 会优先走 Tavily，失败自动退到 DuckDuckGo。<br><br>免费额度 1000 次/月，注册地址 app.tavily.com<br>多个 Key 用 | 分隔，用完自动切下一个',event)">?</button>
+        <button class="btn primary sm" id="tavilySave">保存</button>
+      </div>
+      <div class="row"><label>API Key</label><div style="display:flex;gap:4px;flex:1"><input type="password" id="tavilyKey" placeholder="tvly-dev-…" style="flex:1"><button class="btn sm" onclick="const i=$('#tavilyKey');i.type=i.type==='password'?'text':'password';this.textContent=i.type==='password'?'👁':'🙈'" style="min-width:36px;padding:5px 8px" title="显示/隐藏">👁</button></div></div>
+      <div id="tavilyResult" class="dim mt-2" style="display:none"></div>
+    </div>
+
+    <div class="panel">
+      <div class="panel-header">
+        <span class="panel-title">看图模型 (DescribeImage)</span><button class="help-btn" onclick="showHelp('看图模型','描述 DescribeImage 工具使用的视觉模型。<br><br>表格从上到下依次尝试，失败自动切下一行。同一行的 Model 用逗号分隔（同端点内降级）。',event)">?</button>
         <button class="btn primary sm" id="visionSave">保存</button>
       </div>
-      <div class="row"><label>Base URL</label><input type="text" id="visionUrl" placeholder="https://open.bigmodel.cn/api/paas/v4"></div>
-      <div class="row"><label>API Key</label><input type="password" id="visionKey" placeholder="sk-…"></div>
-      <div class="row"><label>Model</label><input type="text" id="visionModel" placeholder="GLM-4.6V-Flash,glm-4.6v"><span class="dim" style="margin-left:8px">逗号分隔，从左到右依次尝试</span></div>
-      <div class="row"><label>走代理</label><label class="toggle"><input type="checkbox" id="visionProxy"><span class="slider"></span></label><span class="dim" style="margin-left:8px">API 用完可换模型，代理通过总地址</span></div>
+      <div class="row"><label>Max Tokens</label><input type="number" id="visionMaxTokens" placeholder="4096" min="100" max="32000" style="width:120px"><span class="dim" style="margin-left:8px">图片描述最大输出 token，默认 4096</span></div>
+      <div class="row"><label>走代理</label><label class="toggle"><input type="checkbox" id="visionProxy"><span class="slider"></span></label></div>
+      <div class="dim mt-2" style="font-size:12px">从上到下依次尝试，失败自动切下一个。同一行的 Model 逗号分隔（同端点内降级）。</div>
+      <table class="mt-2" style="width:100%;border-collapse:collapse" id="visionTable">
+        <thead><tr><th style="width:35%;text-align:left;font-size:12px;padding:4px 6px">Base URL</th><th style="width:28%;text-align:left;font-size:12px;padding:4px 6px">API Key</th><th style="width:25%;text-align:left;font-size:12px;padding:4px 6px">Model</th><th style="width:12%"></th></tr></thead>
+        <tbody></tbody>
+      </table>
+      <button class="btn sm mt-2" id="visionAddRow">+ 添加一行</button>
+    </div>
+
+    <div class="panel">
+      <div class="panel-header">
+        <span class="panel-title">阅读权限 (Read Root)</span><button class="help-btn" onclick="showHelp('阅读权限','限制 Agent 的文件可见范围。默认=workspace（最严格）。可放宽到 workspace 的上级目录（如 A\B\C），不能设置到其他分支路径（如 A\B\H）。所有路径对 Agent 以相对路径呈现。',event)">?</button>
+        <div class="flex gap-2">
+          <button class="btn sm" id="readRootDefault">默认</button>
+          <button class="btn sm" id="readRootCancel">取消</button>
+          <button class="btn primary sm" id="readRootSave">保存</button>
+        </div>
+      </div>
+      <div class="row"><label>读取根目录</label><input type="text" id="readRootPath" placeholder="默认: workspace 绝对路径" style="flex:1"></div>
+      <div class="row"><label></label><span class="dim" style="font-size:11px">默认 = workspace（最严格）。可设置 workspace 的上级祖先目录以放宽读取范围，但不能设置到其他分支路径。</span></div>
+    </div>
+
+    <div class="panel">
+      <div class="panel-header">
+        <span class="panel-title">工具渲染 <span class="dim">[实验性]</span></span><button class="help-btn" onclick="showHelp('工具渲染','控制单 Agent 路径下工具调用的渲染方式。think=包裹在可折叠的 think 块中（默认）。native=不包裹，由 OWUI 原生渲染工具卡片。仅影响单 Agent（不带旁路的链路等同于单 Agent）。',event)">?</button>
+      </div>
+      <div class="row">
+        <select id="toolRenderMode" onchange="_saveToolRender(this.value)">
+          <option value="think">think 折叠（默认）</option>
+          <option value="details">details 卡片</option>
+        </select>
+      </div>
     </div>
 
   </div>
@@ -668,7 +707,8 @@
 
         <!-- 配置化 -->
         <div style="margin-bottom:14px">
-          <p style="color:var(--accent);font-weight:700;font-size:12px;margin-bottom:4px">▎可视化运维——Admin 面板 + 全链路可观测（V0.4 ~ V0.4.3）</p>
+          <p style="color:var(--accent);font-weight:700;font-size:12px;margin-bottom:4px">▎可视化运维——Admin 面板 + 全链路可观测（V0.4 ~ V0.4.4）</p>
+          <p style="font-size:11px;margin-left:12px"><b>V0.4.4</b> 安全隔离闭环：read_root 阅读权限可配置（Admin 面板直接设置 Agent 文件可见范围），上传文件/图片 SHA256 去重存 .temp/，Agent 自行调用 DescribeImage 描述——消除服务端重复视觉 API 调用。ThinkBalancer 流式 think 标签自动平衡，防止模型字面输出 &lt;think&gt; 标签嵌套失衡导致 OWUI 全部内容被隐藏。前端兼容性：&lt;/think&gt; 后自动插入零宽空格防 Setext 标题误解析，DescribeImage 工具结果显示模型名。</p>
           <p style="font-size:11px;margin-left:12px"><b>V0.4.3</b> 分链路权限管理：每条链路/路由独立 workspace 子目录，共享区读、隔离删改。Git-like MD5 文件变更追踪：Write/Edit/Delete/Bash 操作前差异备份。</p>
           <p style="font-size:11px;margin-left:12px"><b>V0.4.2</b> 排除不稳定因素。文件管理器替代 open-terminal 扩展，消除 History: 格式导致上下文概率消失。</p>
           <p style="font-size:11px;margin-left:12px"><b>V0.4.1</b> UA Store（MiniAgent 缓存 / History 格式缓存 / 旁路工具缓存）、并行旁路、Debug 模式、插件系统。</p>
@@ -711,7 +751,7 @@
         <p style="font-size:11px;margin-left:12px;margin-top:4px"><b>History: 格式</b> — 来自 OWUI Default Function Calling 的工具选择模板。open-terminal 扩展随机触发工具选择，把历史压缩为一行文本，不传递任何历史对话。修复：OWUI→设置→模型→Function Calling→Native/关闭。</p>
         <p style="font-size:11px;margin-left:12px;margin-top:4px"><b>OWUI 不回传 thinking</b> — OWUI 数据库存了 thinking 但发给 API 时按连接类型选择性丢弃。OpenAI 兼容协议下全部丢弃。这是 UA Store、Side Store 等补丁的根本原因。</p>
 
-        <p style="margin-top:10px;font-size:10px">Build: 2026-07-01 · Version: 0.4.3</p>
+        <p style="margin-top:10px;font-size:10px">Build: 2026-07-10 · Version: 0.4.4</p>
       </div>
     </div>
   </div>
@@ -720,8 +760,8 @@
 
 <div class="toast-container" id="toastContainer"></div>
 
-<script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
 <script>
+
 const API = '/admin/api';
 
 // ============ utilities ============
@@ -811,7 +851,7 @@ async function loadDashboard() {
   $('#dashBuild').textContent = (d.version&&d.version.build_date)||'—';
   $('#dashVer').textContent = (d.version&&d.version.version)||'—';
   $('#dashUptime').textContent = (d.version&&d.version.uptime_seconds) ? uptimeStr(d.version.uptime_seconds) : '—';
-  $('#headerVer').textContent = (d.version&&d.version.version)||'v0.4.3';
+  $('#headerVer').textContent = (d.version&&d.version.version)||'v0.4.4';
   loadHealth();
 }
 
@@ -836,6 +876,7 @@ async function loadHealth() {
     if (h.proxy) {
       $('#dashProxy').textContent = h.proxy.online ? `在线 · ${h.proxy.address||''}` : (h.proxy.address ? '离线' : '—');
     }
+
   } catch(e) {}
   _healthPending = false;
 }
@@ -853,11 +894,32 @@ async function loadSettings() {
   $('#proxyApi').checked = !!proxy.use_for_api;
   $('#proxySearch').checked = !!proxy.use_for_websearch;
 
+  $('#tavilyResult').style.display = 'none';
+  $('#tavilyKey').value = _settingsCache.tavily_api_key || '';
+
   const vision = _settingsCache.vision || {};
-  $('#visionUrl').value = vision.base_url || '';
-  $('#visionKey').value = vision.api_key || '';
-  $('#visionModel').value = vision.model || 'GLM-4.6V-Flash';
+  $('#visionMaxTokens').value = vision.max_tokens || 4096;
   $('#visionProxy').checked = !!vision.use_proxy;
+  // Populate vision table
+  const tbody = $('#visionTable tbody');
+  tbody.innerHTML = '';
+  const providers = vision.providers || [];
+  if (!providers.length) {
+    // Seed with empty row
+    providers.push({base_url:'', api_key:'', model:''});
+  }
+  providers.forEach((p, i) => {
+    const tr = document.createElement('tr');
+    tr.innerHTML = `<td style="padding:4px 6px"><input type="text" class="vurl" value="${esc(p.base_url)}" placeholder="https://..." style="width:100%;box-sizing:border-box"></td>
+      <td style="padding:4px 6px;display:flex;gap:2px"><input type="password" class="vkey" value="${esc(p.api_key)}" placeholder="sk-…" style="flex:1;min-width:0"><button class="btn sm visionEye" style="padding:2px 6px;min-width:28px" title="显示/隐藏">👁</button></td>
+      <td style="padding:4px 6px"><input type="text" class="vmodel" value="${esc(p.model)}" placeholder="deepseek-vision" style="width:100%;box-sizing:border-box"></td>
+      <td style="padding:4px 6px;text-align:center"><button class="btn sm visionDelRow" ${providers.length<=1?'disabled':''} style="padding:2px 8px">✕</button></td>`;
+    tbody.appendChild(tr);
+  });
+
+  const readRoot = _settingsCache.read_root || '';
+  $('#readRootPath').value = readRoot;
+  $('#toolRenderMode').value = _settingsCache.tool_render || 'think';
 }
 
 $('#spSave').addEventListener('click', async () => {
@@ -884,6 +946,13 @@ $('#proxySave').addEventListener('click', async () => {
   if (r.ok) { btn.textContent = '✓ 已保存'; btn.style.background = '#10b981'; setTimeout(() => { btn.textContent = orig; btn.style.background = ''; }, 1600); }
   else toast(r.error||'保存失败', 'error');
 });
+$('#tavilySave').addEventListener('click', async () => {
+  const btn = $('#tavilySave');
+  const orig = btn.textContent;
+  const r = await api('PATCH', '/settings/tavily', { api_key: $('#tavilyKey').value });
+  if (r.ok) { btn.textContent = '✓ 已保存'; btn.style.background = '#10b981'; setTimeout(() => { btn.textContent = orig; btn.style.background = ''; }, 1600); }
+  else toast(r.error||'保存失败', 'error');
+});
 $('#proxyTest').addEventListener('click', async () => {
   const addr = $('#proxyAddr').value;
   const el = $('#proxyResult');
@@ -895,12 +964,47 @@ $('#proxyTest').addEventListener('click', async () => {
 $('#visionSave').addEventListener('click', async () => {
   const btn = $('#visionSave');
   const orig = btn.textContent;
-  // NOTE: GET-then-PUT is race-prone in multi-tab; acceptable for single-tab admin use.
+  const providers = [];
+  document.querySelectorAll('#visionTable tbody tr').forEach(tr => {
+    const u = tr.querySelector('.vurl').value.trim();
+    const k = tr.querySelector('.vkey').value.trim();
+    const m = tr.querySelector('.vmodel').value.trim();
+    if (u || k || m) providers.push({base_url: u, api_key: k, model: m});
+  });
   const s = await api('GET', '/settings');
-  s.vision = { base_url: $('#visionUrl').value, api_key: $('#visionKey').value, model: $('#visionModel').value, use_proxy: $('#visionProxy').checked };
+  s.vision = { max_tokens: parseInt($('#visionMaxTokens').value)||4096, use_proxy: $('#visionProxy').checked, providers };
   const r = await api('PUT', '/settings', s);
   if (r.ok) { btn.textContent = '✓ 已保存'; btn.style.background = '#10b981'; setTimeout(() => { btn.textContent = orig; btn.style.background = ''; }, 1600); }
   else toast(r.error||'保存失败', 'error');
+});
+$('#visionAddRow').addEventListener('click', () => {
+  const tbody = $('#visionTable tbody');
+  const tr = document.createElement('tr');
+  tr.innerHTML = `<td style="padding:4px 6px"><input type="text" class="vurl" placeholder="https://..." style="width:100%;box-sizing:border-box"></td>
+    <td style="padding:4px 6px;display:flex;gap:2px"><input type="password" class="vkey" placeholder="sk-…" style="flex:1;min-width:0"><button class="btn sm visionEye" style="padding:2px 6px;min-width:28px" title="显示/隐藏">👁</button></td>
+    <td style="padding:4px 6px"><input type="text" class="vmodel" placeholder="model-id" style="width:100%;box-sizing:border-box"></td>
+    <td style="padding:4px 6px;text-align:center"><button class="btn sm visionDelRow" style="padding:2px 8px">✕</button></td>`;
+  tbody.appendChild(tr);
+  // Enable all del buttons when >1 row
+  if (tbody.children.length > 1) {
+    tbody.querySelectorAll('.visionDelRow').forEach(b => b.disabled = false);
+  }
+});
+$('#visionTable').addEventListener('click', (e) => {
+  if (e.target.classList.contains('visionDelRow')) {
+    const tbody = $('#visionTable tbody');
+    if (tbody.children.length <= 1) return;
+    e.target.closest('tr').remove();
+    if (tbody.children.length <= 1) {
+      tbody.querySelectorAll('.visionDelRow').forEach(b => b.disabled = true);
+    }
+  }
+  if (e.target.classList.contains('visionEye')) {
+    const inp = e.target.parentElement.querySelector('.vkey');
+    const show = inp.type === 'password';
+    inp.type = show ? 'text' : 'password';
+    e.target.textContent = show ? '🙈' : '👁';
+  }
 });
 
 // Debug settings — save handler
@@ -914,6 +1018,34 @@ $('#debugSave').addEventListener('click', async () => {
   if (r.ok) { btn.textContent = '✓ 已保存'; btn.style.background = '#10b981'; setTimeout(() => { btn.textContent = orig; btn.style.background = ''; }, 1600); }
   else toast(r.error||'保存失败', 'error');
 });
+
+// Read Permission — save handler
+$('#readRootSave').addEventListener('click', async () => {
+  const btn = $('#readRootSave');
+  const orig = btn.textContent;
+  const path = $('#readRootPath').value.trim();
+  const s = await api('GET', '/settings');
+  s.read_root = path;
+  const r = await api('PUT', '/settings', s);
+  if (r.ok) { btn.textContent = '✓ 已保存'; btn.style.background = '#10b981'; setTimeout(() => { btn.textContent = orig; btn.style.background = ''; }, 1600); }
+  else toast(r.error||'保存失败', 'error');
+});
+$('#readRootDefault').addEventListener('click', () => {
+  $('#readRootPath').value = '';
+  toast('已重置为默认 (workspace)', 'info');
+});
+$('#readRootCancel').addEventListener('click', () => {
+  const orig = _settingsCache.read_root || '';
+  $('#readRootPath').value = orig;
+  toast('已取消', 'info');
+});
+window._saveToolRender = async function(val) {
+  const s = await api('GET', '/settings');
+  s.tool_render = val;
+  const r = await api('PUT', '/settings', s);
+  if (r.ok) toast(`工具渲染已切换为: ${val}`, 'success');
+  else toast(r.error||'保存失败', 'error');
+};
 
 // Debug log viewer
 async function loadDebugSessions() {

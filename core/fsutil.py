@@ -2,6 +2,7 @@
 
 Imports from core.paths inside functions to avoid circular dependency at import time.
 """
+from __future__ import annotations
 from pathlib import Path
 
 
@@ -40,10 +41,6 @@ def backup_file(path: Path) -> str | None:
 def atomic_write(path: Path, data) -> dict:
     """Write JSON to path atomically via tmp + replace. Returns {"ok": True} or {"ok": False, "error": ...}."""
     import json
-    try:
-        json.dumps(data, ensure_ascii=False)
-    except (TypeError, ValueError) as e:
-        return {"ok": False, "error": f"Not JSON-serializable: {e}"}
     backup_file(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".json.tmp")
@@ -51,7 +48,7 @@ def atomic_write(path: Path, data) -> dict:
         tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
         tmp.replace(path)
         return {"ok": True}
-    except OSError as e:
+    except (OSError, TypeError, ValueError) as e:
         return {"ok": False, "error": str(e)}
     finally:
         try:

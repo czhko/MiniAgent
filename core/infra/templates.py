@@ -1,6 +1,6 @@
 """Template resolution and thinking presets. Layer 2 — depends on paths."""
+from __future__ import annotations
 from pathlib import Path
-from typing import Any
 
 THINKING_PRESETS = {"off": 0, "low": 4000, "high": 16000, "max": 32000}
 THINKING_BUDGET_REVERSE = {0: "off", 4000: "low", 16000: "high", 32000: "max"}
@@ -46,7 +46,6 @@ def resolve_variable(name: str, variables: dict) -> str:
 
 def resolve_template(template: str, variables: dict, extra: dict | None = None) -> str:
     """Replace {variable} and {key} placeholders in a template string."""
-    import re
     result = template
     # Replace {variable_name} placeholders
     for name in variables:

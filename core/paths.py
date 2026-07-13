@@ -3,6 +3,6 @@ from pathlib import Path
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
 WORKSPACE = ROOT_DIR / "workspace"
-BACKUP_DIR = ROOT_DIR / "workspace" / ".backup"
-TRASH_DIR = ROOT_DIR / "workspace" / ".trash"
+BACKUP_DIR = WORKSPACE / ".backup"
+
 LOG_DIR = ROOT_DIR / "config" / "logs"

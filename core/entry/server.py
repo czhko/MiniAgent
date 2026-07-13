@@ -7,13 +7,12 @@ Usage:   python core/server.py  →  http://localhost:18787/v1
 """
 from __future__ import annotations
 
-import base64, hashlib, json, sys, threading, time, uuid
-from pathlib import Path
+import base64, hashlib, json, sys, threading, uuid
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
 from urllib.parse import urlparse
 
-from core.paths import ROOT_DIR, LOG_DIR
+from core.paths import ROOT_DIR, LOG_DIR, WORKSPACE
 sys.path.insert(0, str(ROOT_DIR))
 
 from core.infra.logger import dump_owui, trace_log
@@ -38,64 +37,10 @@ def _log(msg: str, dest: str = ""):
         print(msg, flush=True)
 
 
-def _describe_images(images: list[dict], settings: dict) -> str:
-    """Call vision API for each image, return concatenated descriptions."""
-    vc = settings.get("vision", {})
-    if not vc or not vc.get("api_key"):
-        return ""
-    from urllib.request import Request as _Req
-    from core.http_utils import resolve_proxy_url, build_urllib_opener
-    endpoint = vc["base_url"].rstrip("/") + "/chat/completions"
-    models = [m.strip() for m in (vc.get("model") or "GLM-4.6V-Flash").split(",") if m.strip()]
-    if not models:
-        models = ["GLM-4.6V-Flash"]
-    proxy_url = resolve_proxy_url(vc) if vc.get("use_proxy") else None
-    opener = build_urllib_opener(proxy_url)
-    parts = []
-    for idx, img in enumerate(images):
-        mime = img.get("mime", "png")
-        if mime == "jpg":
-            mime = "jpeg"
-        b64 = img["data"]
-        body = {
-            "model": models[0], "max_tokens": 800,
-            "messages": [{"role": "user", "content": [
-                {"type": "image_url", "image_url": {"url": f"data:image/{mime};base64,{b64}"}},
-                {"type": "text", "text": "请用中文详细描述这张图片的内容。"},
-            ]}],
-        }
-        try:
-            req = _Req(endpoint,
-                       data=json.dumps(body).encode("utf-8"),
-                       headers={"Authorization": f"Bearer {vc['api_key']}", "Content-Type": "application/json"})
-            resp = opener.open(req, timeout=60)
-            data = json.loads(resp.read().decode("utf-8"))
-            desc = data["choices"][0]["message"].get("content", "") or "(no description)"
-            parts.append(f"[上传图片 {idx+1} 的描述: {desc.strip()}]")
-        except Exception as e:
-            parts.append(f"[图片 {idx+1} 描述失败: {e}]")
-    return "\n".join(parts)
-
 
 class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
     daemon_threads = True
     allow_reuse_address = False
-
-
-# ── SSE Helpers ────────────────────────────────────────
-
-def _emit_image_desc(chat_id: str, model: str, image_desc: str, wfile, wfile_lock: threading.Lock):
-    """Emit pre-computed image description as a single <think> SSE chunk."""
-    if not image_desc:
-        return
-    text = f"<think>\n{image_desc}\n</think>\n"
-    try:
-        with wfile_lock:
-            wfile.write(
-                f"data: {json.dumps(make_text_chunk(chat_id, model, text), ensure_ascii=False)}\n\n".encode())
-            wfile.flush()
-    except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
-        pass
 
 
 # ── HTTP Handler ───────────────────────────────────────
@@ -225,29 +170,37 @@ class AgentHTTPHandler(BaseHTTPRequestHandler):
             return self._openai_error("No user message found", 400)
 
         # Detect and process images/files in the last user message
-        image_desc = ""
         try:
             last_user = next((m for m in reversed(messages) if m.get("role") == "user"), None)
             if last_user:
                 content = extract_content(last_user.get("content"))
                 images, files = content["images"], content["files"]
                 if images:
-                    s = load_settings()
-                    desc = _describe_images(images, s)
-                    if desc:
-                        user_text = user_text + "\n\n" + desc
-                        image_desc = desc
+                    temp_dir = WORKSPACE / ".temp"
+                    temp_dir.mkdir(parents=True, exist_ok=True)
+                    img_parts = []
+                    for img in images:
+                        data = base64.b64decode(img["data"])
+                        sha = hashlib.sha256(data).hexdigest()
+                        ext = img.get("mime", "image/png").split("/")[-1]
+                        fpath = temp_dir / f"{sha}.{ext}"
+                        if not fpath.exists():
+                            fpath.write_bytes(data)
+                        img_parts.append(f"[上传图片: {fpath.name} → .temp/{fpath.name}]")
+                    if img_parts:
+                        user_text = user_text + "\n\n" + "\n".join(img_parts)
                 if files:
-                    ws = ROOT_DIR / "workspace" / "owui_uploads"
-                    ws.mkdir(parents=True, exist_ok=True)
+                    temp_dir = WORKSPACE / ".temp"
+                    temp_dir.mkdir(parents=True, exist_ok=True)
                     file_parts = []
                     for f in files:
-                        fname = f.get("name", "unknown")
-                        fpath = ws / fname
-                        from core.fsutil import backup_file
-                        backup_file(fpath)
-                        fpath.write_bytes(base64.b64decode(f["data"]))
-                        file_parts.append(f"[上传文件: {fname} → 已保存到 {fpath}]")
+                        data = base64.b64decode(f["data"])
+                        sha = hashlib.sha256(data).hexdigest()
+                        ext = f.get("name", "unknown").rsplit(".", 1)[-1] if "." in f.get("name", "") else "bin"
+                        fpath = temp_dir / f"{sha}.{ext}"
+                        if not fpath.exists():
+                            fpath.write_bytes(data)
+                        file_parts.append(f"[上传文件: {f.get('name', 'unknown')} → .temp/{fpath.name}]")
                     user_text = user_text + "\n\n" + "\n".join(file_parts)
         except Exception as e:
             _log(f"IMG/FILE process error: {e}", "owui")
@@ -283,8 +236,8 @@ class AgentHTTPHandler(BaseHTTPRequestHandler):
                     if _k not in main_cfg:
                         main_cfg[_k] = chain.get(_k, -1)
                 chain_vars = chain.get("variables", {})
-                return self._handle_single_agent_chat(route, agent_model, session_id, user_text, messages, main_cfg, chain_vars, chain.get("separator", ""), image_desc, debug_ctx)
-            return self._handle_chain_chat(chain, session_id, user_text, messages, image_desc, debug_ctx)
+                return self._handle_single_agent_chat(route, agent_model, session_id, user_text, messages, main_cfg, chain_vars, chain.get("separator", ""), debug_ctx)
+            return self._handle_chain_chat(chain, session_id, user_text, messages, debug_ctx)
 
         # ── Route: {provider}/{model}-agent ──
         route, actual_model = PipelineEngine.resolve_single_agent(model)
@@ -300,16 +253,16 @@ class AgentHTTPHandler(BaseHTTPRequestHandler):
             _log(f"REQ [{session_id}]: single-agent model={actual_model} route={route.get('label','?')}")
             if debug_ctx:
                 debug_ctx.session_id = session_id
-            return self._handle_single_agent_chat(route, actual_model, session_id, user_text, messages, None, None, "", image_desc, debug_ctx)
+            return self._handle_single_agent_chat(route, actual_model, session_id, user_text, messages, None, None, "", debug_ctx)
 
         # Fallback: try as single-agent with default route
         _log(f"REQ [default]: fallback model={model}")
-        return self._handle_single_agent_chat(None, model, "default", user_text, messages, None, None, "", image_desc, debug_ctx)
+        return self._handle_single_agent_chat(None, model, "default", user_text, messages, None, None, "", debug_ctx)
 
     # ── Chain chat (delegates to PipelineEngine) ──────
 
     def _handle_chain_chat(self, chain: dict, session_id: str,
-                           user_text: str, messages: list[dict], image_desc: str = "",
+                           user_text: str, messages: list[dict],
                            debug_ctx=None):
         chat_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
         model_name = chain.get("label", "da")
@@ -333,7 +286,6 @@ class AgentHTTPHandler(BaseHTTPRequestHandler):
         think_open = False
         text_emitted = False
         just_closed = False
-
         def phase_set_cb(phase: str):
             pass
 
@@ -369,14 +321,12 @@ class AgentHTTPHandler(BaseHTTPRequestHandler):
             try:
                 with wfile_lock:
                     self.wfile.write(
-                        f"data: {json.dumps(make_text_chunk(chat_id, model_name, text), ensure_ascii=False)}\n\n".encode())
+                        f"data: {json.dumps(make_text_chunk(chat_id, model_name, text), ensure_ascii=False)}\n\n".encode('utf-8', errors='replace'))
                     self.wfile.flush()
             except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError) as e:
                 _handle_write_error(e)
             except OSError:
                 stop_event.set()
-
-        _emit_image_desc(chat_id, model_name, image_desc, self.wfile, wfile_lock)
 
         # ── Plugin: user injection (before pipeline) ──
         route_label = chain.get("main_path", {}).get("route", "")
@@ -400,7 +350,7 @@ class AgentHTTPHandler(BaseHTTPRequestHandler):
             import traceback as _tb
             _tb.print_exc(file=sys.stderr)
 
-        self._send_stop(chat_id, model_name, result, wfile_lock)
+        self._send_stop(chat_id, model_name, result, wfile_lock, text_emitted)
         heartbeat_stop.set()
         hb_thread.join(timeout=2)
         _log(f"DONE [{session_id}]: chain={chain.get('label')} "
@@ -413,7 +363,7 @@ class AgentHTTPHandler(BaseHTTPRequestHandler):
                                   session_id: str, user_text: str,
                                   messages: list[dict], main_cfg: dict | None = None,
                                   chain_vars: dict | None = None,
-                                  separator: str = "", image_desc: str = "",
+                                  separator: str = "",
                                   debug_ctx=None):
         chat_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
         self._start_sse()
@@ -432,10 +382,10 @@ class AgentHTTPHandler(BaseHTTPRequestHandler):
         hb_thread.start()
 
         just_closed = False
+        text_emitted = False
 
         def emit_cb(phase: str, text: str):
-            nonlocal just_closed
-
+            nonlocal just_closed, text_emitted
             if "</think>" in text:
                 just_closed = True
             elif "<think>" in text:
@@ -447,17 +397,19 @@ class AgentHTTPHandler(BaseHTTPRequestHandler):
                         text = "​\n\n" + text
                     just_closed = False
 
+            if text.strip() and not text.startswith("<think>") and not text.startswith("</think>") and not text.startswith("=== ["):
+                if phase == "main":
+                    text_emitted = True
+
             try:
                 with wfile_lock:
                     self.wfile.write(
-                        f"data: {json.dumps(make_text_chunk(chat_id, model, text), ensure_ascii=False)}\n\n".encode())
+                        f"data: {json.dumps(make_text_chunk(chat_id, model, text), ensure_ascii=False)}\n\n".encode('utf-8', errors='replace'))
                     self.wfile.flush()
             except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError) as e:
                 _handle_write_error(e)
             except OSError:
                 stop_event.set()
-
-        _emit_image_desc(chat_id, model, image_desc, self.wfile, wfile_lock)
 
         # ── Plugin: user injection (before pipeline) ──
         s_route_label = route.get("label", "") if route else ""
@@ -471,7 +423,7 @@ class AgentHTTPHandler(BaseHTTPRequestHandler):
             session_id=session_id, user_text=user_text, messages=messages,
             route=route, agent_model=model,
             chain_cfg={"main_path": main_cfg, "variables": chain_vars or {}, "separator": separator} if main_cfg else None,
-            separator=separator, image_desc=image_desc, debug_ctx=debug_ctx,
+            separator=separator, debug_ctx=debug_ctx,
             stop_event=stop_event, stop_reason=stop_reason[0],
         )
         exec_result = exec_execute(exec_req, emit_cb)
@@ -489,7 +441,7 @@ class AgentHTTPHandler(BaseHTTPRequestHandler):
             import traceback as _tb
             _tb.print_exc(file=sys.stderr)
 
-        self._send_stop(chat_id, model, result, wfile_lock)
+        self._send_stop(chat_id, model, result, wfile_lock, text_emitted)
         heartbeat_stop.set()
         hb_thread.join(timeout=2)
         _log(f"DONE [{session_id}]: single model={model} "
@@ -516,11 +468,14 @@ class AgentHTTPHandler(BaseHTTPRequestHandler):
                 break
 
     def _send_stop(self, chat_id: str, model: str, usage: dict,
-                   lock: threading.Lock):
+                   lock: threading.Lock, text_emitted: bool = True):
         try:
             with lock:
+                if not text_emitted:
+                    self.wfile.write(
+                        f"data: {json.dumps(make_text_chunk(chat_id, model, ' over'), ensure_ascii=False)}\n\n".encode('utf-8', errors='replace'))
                 self.wfile.write(
-                    f"data: {json.dumps(make_stop_chunk(chat_id, model, usage), ensure_ascii=False)}\n\n".encode())
+                    f"data: {json.dumps(make_stop_chunk(chat_id, model, usage), ensure_ascii=False)}\n\n".encode('utf-8', errors='replace'))
                 self.wfile.write(b"data: [DONE]\n\n")
                 self.wfile.flush()
         except Exception:

@@ -1,75 +1,18 @@
-"""v0.4 Pipeline engine — chain execution, single-agent routing, OWUI message parsing."""
+"""v0.4 Pipeline engine — chain execution, single-agent routing."""
 from __future__ import annotations
 
 import re, time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError, as_completed
 from typing import Any, Callable
 
 from core.agent import MiniAgent
 from core.codec.owui import extract_text, parse_history_format
+from core.adapter.owui import rebuild_conversation
 from core.infra.templates import THINKING_PRESETS, resolve_template, normalize_thinking
 from core.infra.settings import load_settings, load_routes, load_chains, get_route, get_agent_workspace, collect_done_tasks
 from core.http_utils import preprocess_base_url
-from core.timeutil import bj_now, bj_epoch
 from core.infra.logger import log_request_start, log_round, log_request_end, trace_model, trace_log
-from core.store.ua import save as ua_save, load as ua_load
-
-
-def apply_owui_text(raw_blocks: list[dict], owui_text: str) -> list[dict]:
-    """Overwrite text blocks in raw_blocks with OWUI text.
-    If OWUI text length matches saved fragment boundaries → split & assign per fragment.
-    Otherwise → user edited → replace all text blocks with OWUI text.
-    """
-    # Extract text fragment lengths (same logic as ua_save joins by \n)
-    lens = []
-    for rb in raw_blocks:
-        if rb.get("role") == "assistant":
-            c = rb.get("content", [])
-            if isinstance(c, list):
-                t = "".join(b.get("text", "") for b in c if b.get("type") == "text")
-                if t:
-                    lens.append(len(t))
-
-    expected = sum(lens) + len(lens) - 1 if lens else -1
-
-    if lens and len(owui_text) == expected:
-        # Lengths match — split OWUI by stored fragment lengths
-        pos = 0
-        fi = 0
-        for rb in raw_blocks:
-            if rb.get("role") == "assistant" and fi < len(lens):
-                c = rb.get("content", [])
-                if isinstance(c, list):
-                    frag = owui_text[pos:pos + lens[fi]]
-                    for blk in c:
-                        if blk.get("type") == "text":
-                            blk["text"] = frag
-                    pos += lens[fi] + 1
-                    fi += 1
-    else:
-        # Length mismatch — separator trimmed or user edited.
-        # Replace only the LAST text block, keep earlier ones intact.
-        replaced = False
-        for rb in reversed(raw_blocks):
-            if rb.get("role") == "assistant":
-                c = rb.get("content", [])
-                if isinstance(c, list):
-                    for blk in reversed(c):
-                        if blk.get("type") == "text":
-                            blk["text"] = owui_text
-                            replaced = True
-                            break
-                if replaced:
-                    break
-        if not replaced:
-            for rb in reversed(raw_blocks):
-                if rb.get("role") == "assistant":
-                    c = rb.get("content", [])
-                    if isinstance(c, list):
-                        c.append({"type": "text", "text": owui_text})
-                        break
-
-    return raw_blocks
+from core.store.ua import save as ua_save
 
 
 def _inject_side_cache(agent, cached_blocks: list[dict], keep_think: int) -> None:
@@ -173,6 +116,18 @@ class PipelineEngine:
         agent.set_provider_config(s)
         agent.set_proxy_config(route_proxy_config)
 
+        # Apply read_root from settings (workspace must be within read_root)
+        rr = s.get("read_root", "").strip()
+        if rr:
+            from pathlib import Path as _P
+            from core.paths import WORKSPACE as _WS
+            rp = _P(rr).resolve()
+            try:
+                _WS.resolve().relative_to(rp)
+                agent._read_root = rp
+            except ValueError:
+                pass
+
         if system_prompt:
             agent.set_system_prompt(system_prompt)
 
@@ -210,11 +165,11 @@ class PipelineEngine:
         emit_cb("main", "<think>\n")
         emit_cb("main", "=== [旁路] ===\n")
 
-        def _run_one(idx: int, side_cfg: dict) -> tuple[int, str, dict]:
+        def _run_one(idx: int, side_cfg: dict) -> tuple[int, str, dict, list, str]:
             route = get_route(side_cfg.get("route", ""))
             side_mock = side_cfg.get("mock_content", "").strip()
             if not route and not side_mock:
-                return idx, "", {}
+                return idx, "", {}, [], ""
             if side_mock:
                 mock_resolved = resolve_template(side_mock, variables, extra)
                 text_lines = [line for line in mock_resolved.split("\n")
@@ -223,9 +178,9 @@ class PipelineEngine:
                     lc = line.strip()
                     if lc:
                         emit_cb("main", lc + "\n")
-                return idx, text_lines[-1] if text_lines else "", {}
+                return idx, text_lines[-1] if text_lines else "", {}, [], ""
             if not route:
-                return idx, "", {}
+                return idx, "", {}, [], ""
             side_type = side_cfg.get("type", "agent")
             sp_template = side_cfg.get("system_prompt", "")
             side_sp = resolve_template(sp_template, variables, {"user_text": extra.get("user_text", ""), "side_text": ""})
@@ -286,17 +241,20 @@ class PipelineEngine:
 
         with ThreadPoolExecutor(max_workers=n) as pool:
             futures = {pool.submit(_run_one, idx, cfg): idx for idx, cfg in enumerate(side_paths)}
-            for f in as_completed(futures, timeout=120):
-                try:
-                    idx, side_text, usage, side_raw, side_lbl = f.result()
-                    side_texts[idx] = side_text
-                    for k in tokens:
-                        tokens[k] += usage.get(k, 0)
-                    if side_raw:
-                        side_blocks_dict[side_lbl] = side_raw
-                except Exception:
-                    idx = futures[f]
-                    emit_cb("main", f"⚠ 旁路{idx}超时/异常\n")
+            try:
+                for f in as_completed(futures, timeout=120):
+                    try:
+                        idx, side_text, usage, side_raw, side_lbl = f.result()
+                        side_texts[idx] = side_text
+                        for k in tokens:
+                            tokens[k] += usage.get(k, 0)
+                        if side_raw:
+                            side_blocks_dict[side_lbl] = side_raw
+                    except Exception:
+                        idx = futures[f]
+                        emit_cb("main", f"⚠ 旁路{idx}超时/异常\n")
+            except FuturesTimeoutError:
+                emit_cb("main", "⚠ 旁路执行超时(120s)\n")
 
         emit_cb("main", "\n</think>\n")
         return {"side_texts": side_texts, "tokens": tokens, "side_blocks": side_blocks_dict}
@@ -332,7 +290,7 @@ class PipelineEngine:
 
         if not all_models:
             all_models = [
-                {"id": "roleplay", "object": "model", "created": int(bj_epoch()), "owned_by": "da"},
+                {"id": "roleplay", "object": "model", "created": int(time.time()), "owned_by": "da"},
             ]
         return {"object": "list", "data": all_models}
 
@@ -371,65 +329,9 @@ class PipelineEngine:
                     break
 
         # ── Rebuild MAIN conversation from OWUI messages ──
-        last_user_idx = -1
-        for i, m in enumerate(messages):
-            if m.get("role") == "user":
-                last_user_idx = i
-
-        shared_conv: list[dict] = []
-        turn = 0
-        ua_hits = 0
-        ua_total = 0
-        all_ua_sides: dict[str, list] = {}
-        total_user_turns = sum(1 for i, m in enumerate(messages)
-                               if m.get("role") == "user" and i != last_user_idx)
-        for i, m in enumerate(messages):
-            if i == last_user_idx:
-                continue
-            role = m.get("role", "")
-            content = extract_text(m.get("content"))
-            if role == "user" and content.strip():
-                turn += 1
-                shared_conv.append({
-                    "role": "user", "content": content, "turn": turn,
-                    "turn_time": bj_now().isoformat(),
-                })
-            elif role == "assistant":
-                text = content or "(thinking)"
-                # Try to restore raw blocks from UA store BEFORE separator trimming.
-                # UA store key = hash of full text; separator strips the text → hash mismatch.
-                _do_restore = keep_think < 0 or turn > total_user_turns - keep_think
-                if _do_restore:
-                    ua_total += 1
-                    raw_blocks, ua_sides = ua_load(text)
-                    if raw_blocks:
-                        ua_hits += 1
-                        if ua_sides:
-                            for s_label, s_blocks in ua_sides.items():
-                                all_ua_sides.setdefault(s_label, []).extend(s_blocks)
-                else:
-                    raw_blocks = None
-                # Separator trim (after UA lookup to preserve hash match)
-                sep = chain.get("separator", "")
-                if sep:
-                    idx = text.rfind(sep)
-                    if idx != -1:
-                        trimmed = text[idx + len(sep):].strip()
-                        if trimmed:
-                            text = trimmed
-                if raw_blocks:
-                    apply_owui_text(raw_blocks, text)
-                    for rb in raw_blocks:
-                        if isinstance(rb, dict) and rb.get("role") in ("assistant", "user"):
-                            if "turn" not in rb:
-                                rb["turn"] = turn
-                            shared_conv.append(rb)
-                else:
-                    shared_conv.append({
-                        "role": "assistant",
-                        "content": [{"type": "text", "text": text}],
-                        "turn": turn,
-                    })
+        sep = chain.get("separator", "")
+        shared_conv, turn, ua_hits, ua_total, all_ua_sides = rebuild_conversation(
+            messages, separator=sep, keep_think=keep_think)
 
         # ── Emit history stats (before any side/main output) ──
         if debug_ctx:
@@ -444,7 +346,7 @@ class PipelineEngine:
         log_entry = log_request_start(session_id, chain.get("label", ""),
                                       chain.get("main_path", {}).get("route", ""),
                                       chain.get("main_path", {}).get("model", ""))
-        t_start = bj_epoch()
+        t_start = time.time()
         all_debug_blocks: list[dict] = []
 
         side_paths = chain.get("side_paths", [])
@@ -670,7 +572,7 @@ class PipelineEngine:
                 else:
                     emit_cb("main", lc + "\n")
             total_tokens["input"] += 1
-            log_request_end(log_entry, "ok", total_tokens, int((bj_epoch() - t_start) * 1000), {})
+            log_request_end(log_entry, "ok", total_tokens, int((time.time() - t_start) * 1000), {})
             if debug_ctx:
                 debug_ctx.flush()
             return {**total_tokens, "assistant_text": ""}
@@ -840,7 +742,7 @@ class PipelineEngine:
             agent.cleanup_after_stop()
 
         # Log completion
-        duration_ms = int((bj_epoch() - t_start) * 1000)
+        duration_ms = int((time.time() - t_start) * 1000)
         status = "ok"
         if main_err:
             status = "error"

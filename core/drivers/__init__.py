@@ -1,4 +1,5 @@
 """Model driver registry. Layer 4."""
+from __future__ import annotations
 from core.drivers.base import ModelDriver, ModelRequest, ModelResponse, ThinkingConfig
 from core.drivers.anthropic import AnthropicDriver
 from core.drivers.openai import OpenAIDriver

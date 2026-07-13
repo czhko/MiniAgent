@@ -13,10 +13,10 @@ from core.codec.owui import extract_text, parse_history_format
 from core.infra.templates import THINKING_PRESETS, resolve_template, normalize_thinking
 from core.infra.settings import load_settings, load_routes, get_route, get_agent_workspace, collect_done_tasks
 from core.http_utils import preprocess_base_url
-from core.timeutil import bj_now, bj_epoch
-from core.infra.logger import log_request_start, log_request_end, log_round, trace_model, trace_log
-from core.engine.pipeline import PipelineEngine, apply_owui_text
-from core.store.ua import save as ua_save, load as ua_load
+from core.infra.logger import log_request_start, log_request_end, trace_log
+from core.engine.pipeline import PipelineEngine
+from core.adapter.owui import rebuild_conversation, make_on_event
+from core.store.ua import save as ua_save
 
 
 @dataclass
@@ -29,7 +29,6 @@ class ExecRequest:
     chain_cfg:     dict | None = None
     variables:     dict = field(default_factory=dict)
     separator:     str = ""
-    image_desc:    str = ""
     debug_ctx:     Any | None = None
     stop_event:    Any | None = None
     stop_reason:   str = ""
@@ -119,119 +118,18 @@ def _prepare_agent(req: ExecRequest, main_cfg: dict | None = None) -> MiniAgent:
         sp = s.get("system", {}).get("system_prompt", "").strip()
         if sp:
             agent.set_system_prompt(sp)
+    # Apply read_root from settings (workspace must be within read_root)
+    rr = s.get("read_root", "").strip()
+    if rr:
+        from pathlib import Path as _P
+        from core.paths import WORKSPACE as _WS
+        rp = _P(rr).resolve()
+        try:
+            _WS.resolve().relative_to(rp)
+            agent._read_root = rp
+        except ValueError:
+            pass
     return agent
-
-
-# ── Conversation rebuild (shared between all paths) ────────
-
-def _rebuild_conversation(
-    agent: MiniAgent, messages: list[dict],
-    separator: str = "", keep_think: int = -1
-) -> tuple[int, int]:
-    """Rebuild agent.conversation from OWUI messages. Returns (ua_hits, ua_total)."""
-    last_user_idx = -1
-    for i, m in enumerate(messages):
-        if m.get("role") == "user":
-            last_user_idx = i
-
-    turn = 0
-    ua_hits = 0
-    ua_total = 0
-    total_user_turns = sum(1 for i, m in enumerate(messages)
-                           if m.get("role") == "user" and i != last_user_idx)
-    for i, m in enumerate(messages):
-        if i == last_user_idx:
-            continue
-        role = m.get("role", "")
-        content = extract_text(m.get("content"))
-        if role == "user" and content.strip():
-            turn += 1
-            agent.conversation.append({
-                "role": "user", "content": content, "turn": turn,
-                "turn_time": bj_now().isoformat(),
-            })
-        elif role == "assistant":
-            text = content or "(thinking)"
-            _do_restore = keep_think < 0 or turn > total_user_turns - keep_think
-            if _do_restore:
-                ua_total += 1
-                raw_blocks, _ = ua_load(text)
-                if raw_blocks:
-                    ua_hits += 1
-            else:
-                raw_blocks = None
-            if separator:
-                idx = text.rfind(separator)
-                if idx != -1:
-                    trimmed = text[idx + len(separator):].strip()
-                    if trimmed:
-                        text = trimmed
-            if raw_blocks:
-                apply_owui_text(raw_blocks, text)
-                for rb in raw_blocks:
-                    if isinstance(rb, dict) and rb.get("role") in ("assistant", "user"):
-                        if "turn" not in rb:
-                            rb["turn"] = turn
-                        agent.conversation.append(rb)
-            else:
-                agent.conversation.append({
-                    "role": "assistant",
-                    "content": [{"type": "text", "text": text}],
-                    "turn": turn,
-                })
-    agent.set_turn(turn)
-    agent.clean_orphaned_tool_results()
-    return ua_hits, ua_total
-
-
-# ── Shared emit wrapper ─────────────────────────────────────
-
-def _make_on_event(session_id: str, phase: str, emit_cb, log_entry):
-    """Create on_event callback with think-wrapping and logging."""
-    think_open = False
-    tool_round = 0
-    round_blocks: list[dict] = []
-
-    def on_event(etype: str, data: dict):
-        nonlocal think_open, tool_round, round_blocks
-        trace_model(session_id, phase, etype, data)
-
-        if etype == "thinking":
-            round_blocks.append({"type": "thinking", "thinking": data.get("delta", ""), "source": "model"})
-            if not think_open:
-                emit_cb(phase, "<think>\n")
-                think_open = True
-            emit_cb(phase, data.get("delta", ""))
-        elif etype == "text":
-            round_blocks.append({"type": "text", "text": data.get("delta", ""), "source": "model"})
-            if think_open:
-                emit_cb(phase, "</think>\n\n")
-                think_open = False
-            t = data.get("delta", "")
-            if t:
-                emit_cb(phase, t)
-        elif etype == "tool_use":
-            round_blocks.append({"type": "tool_use", "name": data.get("name", "?"), "input": data.get("input", {}), "source": "model"})
-            if not think_open:
-                emit_cb(phase, "<think>\n")
-                think_open = True
-            emit_cb(phase, f"\U0001f527 {data.get('name','?')} {str(data.get('input',{}))[:200]}\n")
-        elif etype == "tool_result":
-            c = data.get("content", "") or ""
-            is_err = data.get("is_error", False)
-            round_blocks.append({"type": "tool_result", "content": c, "is_error": is_err, "source": "model"})
-            if c:
-                prefix = "❌" if is_err else "\U0001f4cb"
-                emit_cb(phase, f"{prefix} {data.get('name','?')} {c[:500]}\n")
-        elif etype == "usage":
-            tool_round += 1
-            log_round(log_entry, phase, tool_round, round_blocks)
-            round_blocks.clear()
-            if think_open:
-                emit_cb(phase, "</think>\n\n")
-                think_open = False
-
-    return on_event, lambda: (think_open, tool_round, round_blocks)
 
 
 # ── Single-agent path (0 side paths) ───────────────────────
@@ -270,8 +168,12 @@ def _run_single(req: ExecRequest, emit_cb, phase_set_cb=None) -> ExecResult:
     separator = req.separator or chain.get("separator", "")
 
     # Rebuild conversation
-    t0 = bj_epoch()
-    ua_hits, ua_total = _rebuild_conversation(agent, messages, separator, keep_think)
+    t0 = time.time()
+    conv, turn, ua_hits, ua_total, _ = rebuild_conversation(
+        messages, separator=separator, keep_think=keep_think)
+    agent.conversation = list(conv)
+    agent.set_turn(turn)
+    agent.clean_orphaned_tool_results()
 
     if req.debug_ctx:
         agent.debug_ctx = req.debug_ctx
@@ -280,7 +182,7 @@ def _run_single(req: ExecRequest, emit_cb, phase_set_cb=None) -> ExecResult:
     phase = "main" if chain else "main"
     route_label = (req.route or {}).get("label", "")
     log_entry = log_request_start(req.session_id, chain.get("label", ""), route_label, req.agent_model)
-    t_start = bj_epoch()
+    t_start = time.time()
 
     if main_cfg and main_cfg.get("_show_history_stats", False):
         history_chars = sum(len(extract_text(m.get("content", ""))) for m in messages if m.get("role") in ("user", "assistant"))
@@ -290,13 +192,15 @@ def _run_single(req: ExecRequest, emit_cb, phase_set_cb=None) -> ExecResult:
     if chain_keep >= 0:
         PipelineEngine.clean_conversation(agent, chain_keep)
 
-    _rebuild_ms = int((bj_epoch() - t0) * 1000)
+    _rebuild_ms = int((time.time() - t0) * 1000)
     _conv_chars = sum(len(str(m.get("content", ""))) for m in agent.conversation)
     trace_log(
         f"REBUILD: {_rebuild_ms}ms {len(agent.conversation)}msgs {_conv_chars}chars "
         f"keep_turns={chain_keep} keep_think={keep_think}")
 
-    on_event, _get_state = _make_on_event(req.session_id, phase, emit_cb, log_entry)
+    tool_render = load_settings().get("tool_render", "think")
+    on_event, _get_state = make_on_event(req.session_id, phase, emit_cb, log_entry,
+                                          tool_render=tool_render, model=req.agent_model or "")
     think_open = False
 
     done_output = collect_done_tasks(agent.workspace)
@@ -306,7 +210,7 @@ def _run_single(req: ExecRequest, emit_cb, phase_set_cb=None) -> ExecResult:
     if req.stop_event:
         agent.set_stop_event(req.stop_event)
     pre_usage = dict(agent.token_usage)
-    _hm_t0 = bj_epoch()
+    _hm_t0 = time.time()
     try:
         agent.handle_message(actual_user_text, on_event=on_event)
     except Exception:
@@ -316,12 +220,12 @@ def _run_single(req: ExecRequest, emit_cb, phase_set_cb=None) -> ExecResult:
         except Exception:
             pass
     finally:
-        _hm_ms = int((bj_epoch() - _hm_t0) * 1000)
+        _hm_ms = int((time.time() - _hm_t0) * 1000)
         trace_log(
             f"HANDLE_MSG: {_hm_ms}ms "
             f"conv_grew={len(agent.conversation) - len(messages)} "
             f"tokens_in={agent.token_usage['in']-pre_usage['in']}")
-        think_open, _, _ = _get_state()
+        think_open, _, _, _owui_text = _get_state()
         if think_open:
             try:
                 emit_cb(phase, "</think>\n\n")
@@ -332,19 +236,22 @@ def _run_single(req: ExecRequest, emit_cb, phase_set_cb=None) -> ExecResult:
 
     raw_blocks = agent.last_raw_blocks
     if raw_blocks:
-        texts = []
-        for rb in raw_blocks:
-            if rb.get("role") == "assistant":
-                c = rb.get("content", [])
-                if isinstance(c, list):
-                    t = "".join(b.get("text", "") for b in c if b.get("type") == "text")
-                    if t:
-                        texts.append(t)
-        all_a_text = "\n".join(texts)
-        if all_a_text:
-            ua_save(all_a_text, raw_blocks)
+        if _owui_text:
+            ua_save(_owui_text.rstrip("\n"), raw_blocks)
+        else:
+            texts = []
+            for rb in raw_blocks:
+                if rb.get("role") == "assistant":
+                    c = rb.get("content", [])
+                    if isinstance(c, list):
+                        t = "".join(b.get("text", "") for b in c if b.get("type") == "text")
+                        if t:
+                            texts.append(t)
+            all_a_text = "\n".join(texts)
+            if all_a_text:
+                ua_save(all_a_text, raw_blocks)
 
-    dur = int((bj_epoch() - t_start) * 1000)
+    dur = int((time.time() - t_start) * 1000)
     tokens = {
         "input": agent.token_usage["in"] - pre_usage["in"],
         "output": agent.token_usage["out"] - pre_usage["out"],

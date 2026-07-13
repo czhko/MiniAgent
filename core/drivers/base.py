@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Callable, Protocol
+from typing import Callable, Protocol
 
 # Event callback: (etype: str, data: dict) -> None
 EventFn = Callable[[str, dict], None]
@@ -16,9 +16,6 @@ class ThinkingConfig:
 
     def to_anthropic(self) -> dict:
         return {"type": "enabled", "budget_tokens": self.budget_tokens}
-
-    def to_openai(self) -> dict | None:
-        return None  # OpenAI uses max_completion_tokens, not a thinking param
 
 
 @dataclass

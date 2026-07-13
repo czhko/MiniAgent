@@ -7,6 +7,13 @@ import httpx
 import urllib.request
 
 
+def _remove_suffix(s: str, suffix: str) -> str:
+    """Python 3.8 compat: str.removesuffix is 3.9+."""
+    if s.endswith(suffix):
+        return s[:-len(suffix)]
+    return s
+
+
 def resolve_proxy_url(proxy_config: dict | None) -> str | None:
     """Extract proxy URL from config dict. Returns None if disabled or empty."""
     if not proxy_config or not proxy_config.get("address"):
@@ -25,12 +32,13 @@ def preprocess_base_url(base_url: str) -> str:
     (/v1/chat/completions, /chat/completions).  Longer prefixes are stripped
     first to avoid the shorter suffix consuming part of the longer one.
     """
-    return (base_url.strip().rstrip("/")
-            .removesuffix("/v1/messages")
-            .removesuffix("/v1/chat/completions")
-            .removesuffix("/messages")
-            .removesuffix("/chat/completions")
-            .removesuffix("/v1"))
+    s = base_url.strip().rstrip("/")
+    s = _remove_suffix(s, "/v1/messages")
+    s = _remove_suffix(s, "/v1/chat/completions")
+    s = _remove_suffix(s, "/messages")
+    s = _remove_suffix(s, "/chat/completions")
+    s = _remove_suffix(s, "/v1")
+    return s
 
 
 def build_anthropic_messages_url(base_url: str) -> str:
@@ -40,7 +48,8 @@ def build_anthropic_messages_url(base_url: str) -> str:
     already-normalised URLs as well as raw base_url values.
     """
     base = base_url.strip().rstrip("/")
-    base = base.removesuffix("/v1/messages").removesuffix("/messages")
+    base = _remove_suffix(base, "/v1/messages")
+    base = _remove_suffix(base, "/messages")
     parsed = urlparse(base)
     path = parsed.path.rstrip("/")
     if path.endswith("/v1"):
@@ -54,11 +63,10 @@ def build_openai_chat_url(base_url: str) -> str:
     Defensive: strips known suffixes before reconstructing.
     """
     base = base_url.strip().rstrip("/")
-    base = (base
-            .removesuffix("/v1/chat/completions")
-            .removesuffix("/chat/completions")
-            .removesuffix("/v1/messages")
-            .removesuffix("/messages"))
+    base = _remove_suffix(base, "/v1/chat/completions")
+    base = _remove_suffix(base, "/chat/completions")
+    base = _remove_suffix(base, "/v1/messages")
+    base = _remove_suffix(base, "/messages")
     parsed = urlparse(base)
     path = parsed.path.rstrip("/")
     if path.endswith("/v1"):
@@ -75,7 +83,7 @@ def build_httpx_client(proxy_url: str | None = None, timeout: float = 600, conne
 
 
 def build_urllib_opener(proxy_url: str | None = None) -> urllib.request.OpenerDirector:
-    """Build a urllib opener with optional proxy for WebSearch/WebFetch."""
+    """Build a urllib OpenerDirector with optional proxy."""
     if proxy_url:
         handler = urllib.request.ProxyHandler({"http": proxy_url, "https": proxy_url})
         return urllib.request.build_opener(handler)

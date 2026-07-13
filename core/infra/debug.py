@@ -15,10 +15,8 @@ JSONL entry types (for Admin color coding):
 from __future__ import annotations
 
 import json
-from pathlib import Path
-from typing import Any
 
-from core.paths import ROOT_DIR, LOG_DIR
+from core.paths import LOG_DIR
 from core.timeutil import bj_now, bj_epoch
 
 

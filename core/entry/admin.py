@@ -1,7 +1,7 @@
 """v0.4 Admin backend — REST API + inline HTML page."""
 from __future__ import annotations
 
-import base64, hashlib, json, re, threading, time as _time
+import base64, json, os, re, threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
@@ -11,7 +11,7 @@ import httpx
 
 from core.paths import ROOT_DIR
 from core.infra.settings import load_settings, save_settings, load_routes, save_routes, load_chains, save_chains, load_plugins, save_plugins, get_route
-from core.timeutil import bj_now, bj_epoch
+from core.timeutil import bj_epoch
 from core.infra.logger import query_logs, get_log_detail
 from core.http_utils import preprocess_base_url
 from core.fsutil import backup_file
@@ -48,6 +48,8 @@ class AdminBackend:
         if method == "GET":
             if path in ("/admin", "/admin/"):
                 return AdminBackend._admin_html()
+            if path == "/admin/marked.min.js":
+                return AdminBackend._marked_js()
             if path == "/admin/api/status":
                 return AdminBackend._dashboard_status()
             if path == "/admin/api/status/health":
@@ -138,6 +140,8 @@ class AdminBackend:
                 return AdminBackend._patch_system(body)
             if path == "/admin/api/settings/proxy":
                 return AdminBackend._patch_proxy(body)
+            if path == "/admin/api/settings/tavily":
+                return AdminBackend._patch_tavily(body)
             if path == "/admin/api/files/rename":
                 return AdminBackend._rename_file(body)
 
@@ -155,6 +159,14 @@ class AdminBackend:
             return html_path.read_bytes(), "text/html; charset=utf-8", 200
         except (OSError, FileNotFoundError):
             return b"<html><body><h1>admin.html not found</h1></body></html>", "text/html; charset=utf-8", 500
+
+    @staticmethod
+    def _marked_js() -> tuple[bytes, str, int]:
+        js_path = Path(__file__).resolve().parent / "marked.min.js"
+        try:
+            return js_path.read_bytes(), "application/javascript; charset=utf-8", 200
+        except (OSError, FileNotFoundError):
+            return b"", "text/plain", 404
 
     # ── Dashboard ─────────────────────────────────────
 
@@ -185,7 +197,7 @@ class AdminBackend:
                       "tokens_in": stats.get("total_in", 0),
                       "tokens_out": stats.get("total_out", 0),
                       "cache_read": stats.get("cache_read", 0)},
-            "version": {"build_date": "2026-07-01", "version": "0.4.3",
+            "version": {"build_date": "2026-07-10", "version": "0.4.4",
                         "uptime_seconds": int(bj_epoch() - _START_TIME)},
         })
 
@@ -311,6 +323,16 @@ class AdminBackend:
             s = load_settings()
             s.setdefault("proxy", {})
             s["proxy"].update(body)
+            result = save_settings(s)
+        return AdminBackend._json_response(result)
+
+    @staticmethod
+    def _patch_tavily(body: dict | None) -> tuple[bytes, str, int]:
+        if not isinstance(body, dict) or "api_key" not in body:
+            return AdminBackend._json_response({"ok": False, "error": "Invalid JSON"}, 400)
+        with _crud_lock:
+            s = load_settings()
+            s["tavily_api_key"] = body["api_key"]
             result = save_settings(s)
         return AdminBackend._json_response(result)
 
@@ -791,7 +813,8 @@ class AdminBackend:
         else:
             p = (ROOT_DIR / rel).resolve()
         root = ROOT_DIR.resolve()
-        if not str(p).startswith(str(root)):
+        root_str = str(root)
+        if str(p) != root_str and not str(p).startswith(root_str + os.sep):
             return None
         return p
 
@@ -964,18 +987,7 @@ class AdminBackend:
             return AdminBackend._json_response({"ok": False, "error": "Path not found"}, 404)
         try:
             backup_file(target)
-            # Move to .trash/ preserving relative path to avoid collisions
-            trash_dir = ROOT_DIR / "workspace" / ".trash"
-            trash_dir.mkdir(parents=True, exist_ok=True)
-            rel = target.resolve().relative_to(ROOT_DIR.resolve())
-            # Flatten path: workspace/sub/file.txt → workspace_sub_file.txt
-            trash_name = str(rel).replace('\\', '_').replace('/', '_')
-            trash_path = trash_dir / trash_name
-            # If name collision, append timestamp
-            if trash_path.exists():
-                import time as _tm
-                trash_path = trash_dir / (trash_name + '_' + str(int(_tm.time())))
-            target.rename(trash_path)
+            target.unlink()
             return AdminBackend._json_response({"ok": True})
         except OSError as e:
             return AdminBackend._json_response({"ok": False, "error": str(e)}, 500)

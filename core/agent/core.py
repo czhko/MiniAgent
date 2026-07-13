@@ -110,7 +110,7 @@ def build_tools() -> list[dict[str, Any]]:
             },
         },
         {
-            "name": "WebSearch", "description": "Search the web. Uses DuckDuckGo (no API key).",
+            "name": "WebSearch", "description": "Search the web. Uses Tavily when API key configured, falls back to DuckDuckGo.",
             "input_schema": {
                 "type": "object",
                 "properties": {
@@ -128,6 +128,40 @@ def build_tools() -> list[dict[str, Any]]:
                 "properties": {
                     "url": {"type": "string", "format": "uri"},
                     "prompt": {"type": "string", "description": "What to extract from the page"},
+                },
+                "required": ["url"], "additionalProperties": False,
+            },
+        },
+        {
+            "name": "TavilyExtract", "description": "Extract clean content from one or more URLs. Returns structured text for each URL.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "urls": {"type": "array", "items": {"type": "string", "format": "uri"}, "description": "List of URLs to extract content from"},
+                    "extract_depth": {"type": "string", "enum": ["basic", "advanced"], "description": "basic is faster/cheaper. advanced for complex pages."},
+                },
+                "required": ["urls"], "additionalProperties": False,
+            },
+        },
+        {
+            "name": "TavilyCrawl", "description": "Crawl a website starting from a URL. Maps the site structure then extracts content from discovered pages.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string", "format": "uri", "description": "Starting URL to crawl from"},
+                    "max_pages": {"type": "integer", "minimum": 1, "maximum": 50, "description": "Max pages to crawl. Default 10."},
+                    "extract_depth": {"type": "string", "enum": ["basic", "advanced"], "description": "basic is faster/cheaper."},
+                },
+                "required": ["url"], "additionalProperties": False,
+            },
+        },
+        {
+            "name": "TavilyMap", "description": "Map a website's structure — discover all pages and subdomains linked from a URL.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string", "format": "uri"},
+                    "max_links": {"type": "integer", "minimum": 1, "maximum": 100, "description": "Max links to return. Default 20."},
                 },
                 "required": ["url"], "additionalProperties": False,
             },
@@ -244,6 +278,7 @@ class MiniAgent:
         self._provider_config: dict[str, Any] = {}
         self._vision_config: dict[str, Any] = vision_config or {}
         self._proxy_config: dict[str, Any] = {}  # {"address":"...","use_for_api":bool,"use_for_websearch":bool}
+        self._read_root: Path = _SHARED_WORKSPACE.resolve()  # default: workspace root
         self.system_prompt_text = build_system_prompt(self.workspace, self.model, custom_md_text)
 
         self._tools_anthropic = build_tools()
@@ -306,10 +341,6 @@ class MiniAgent:
         """Last round's raw content blocks (read-only)."""
         return getattr(self, "_last_raw_blocks", None)
 
-    def reset_turn(self) -> None:
-        """Reset turn counter (used when clearing conversation)."""
-        self._turn = 0
-
     def set_turn(self, n: int) -> None:
         """Set turn counter to a specific value."""
         self._turn = n
@@ -364,6 +395,13 @@ class MiniAgent:
 
             try:
                 text, content_blocks = self._call_model(on_event)
+                # Auto-close unbalanced <thinking> tags in each text block.
+                # M3 often opens <thinking> without closing — COT bleeds into body.
+                for b in (content_blocks or []):
+                    if b.get("type") == "text":
+                        diff = b["text"].count("<thinking>") - b["text"].count("</thinking>")
+                        if diff > 0:
+                            b["text"] += "</thinking>" * diff
             except Exception:
                 if not self._stop_event.is_set():
                     with self._msg_lock:
@@ -412,6 +450,8 @@ class MiniAgent:
                                     "content": r["content"],
                                     "is_error": r["is_error"],
                                 }
+                                if "model" in r:
+                                    tool_results[idx]["model"] = r["model"]
                             except Exception as e:
                                 tool_results[idx] = {
                                     "type": "tool_result",
@@ -449,7 +489,10 @@ class MiniAgent:
                                 "name": tu_match["name"] if tu_match else "?",
                                 "content": tr.get("content", ""),
                                 "is_error": tr.get("is_error", False),
+                                "model": tr.get("model", ""),
                             })
+                    for tr in tool_results:
+                        tr.pop("model", None)
                     self.conversation.append({
                         "role": "user", "content": tool_results, "turn": self._turn,
                     })
@@ -539,12 +582,11 @@ class MiniAgent:
                 last_err = e
                 msg = str(e).lower()
                 try:
-                    from core.infra.logger import log_model_req
+                    from core.infra.logger import log_model_req, trace_log
                     log_model_req(self.protocol, {"ts": bj_epoch(), "type": "response", "status": "error",
                              "error": str(e)[:500], "attempt": attempt + 1,
                              "error_type": type(e).__name__,
                              "error_full": repr(e)[:1000]})
-                    from core.infra.logger import trace_log
                     trace_log(
                         f"MODEL_ERR attempt={attempt+1}/3 {type(e).__name__}: {str(e)[:300]}",
                         dest="model_req")
@@ -584,6 +626,7 @@ class MiniAgent:
     def _resolve(self, raw: str) -> Path:
         # Model often sends Unix paths like /root/x, /workspace/x, /root/workspace/x.
         # Strip known Unix prefix cruft and treat the rest as a relative path.
+        root = self._read_root
         if raw.startswith("/") and not raw.startswith("//"):
             # Handle /home/user/rest → rest
             if raw.startswith("/home/") and raw.count("/") >= 3:
@@ -596,33 +639,61 @@ class MiniAgent:
             # Remaining path → workspace relative (or just filename as fallback)
             p = Path(raw)
             if p.parts and p.parts[0] != "..":
-                candidate = (self.workspace / p).resolve()
+                candidate = (root / p).resolve()
                 if candidate.exists():
-                    return candidate
+                    return self._check_read_root(candidate, root)
                 # Fallback: search shared workspace for read access
                 shared = (_SHARED_WORKSPACE / p).resolve()
                 if shared.exists():
-                    return shared
+                    return self._check_read_root(shared, root)
             # Last resort: search by filename (own workspace first, then shared)
             name = Path(raw).name
             if name:
-                matches = list(self.workspace.rglob(name))
+                matches = list(root.rglob(name))
                 if len(matches) == 1:
-                    return matches[0].resolve()
+                    return self._check_read_root(matches[0].resolve(), root)
                 matches = list(_SHARED_WORKSPACE.rglob(name))
                 if len(matches) == 1:
-                    return matches[0].resolve()
-                return (self.workspace / name).resolve()
+                    return self._check_read_root(matches[0].resolve(), root)
+                return self._check_read_root(root / name, root)
+        # Strip workspace prefix if model accidentally included it.
+        # The model may pass "workspace/MiniMax-M3/x" (relative to project
+        # root) or just "MiniMax-M3/x" (relative to global workspace).
+        import core.paths as _paths
+        for _base in (root.resolve(), _paths.ROOT_DIR.resolve()):
+            try:
+                _ws_rel = str(self.workspace.resolve().relative_to(_base))
+                _pfx = _ws_rel.replace("\\", "/")
+                _raw = raw.replace("\\", "/")
+                if _raw == _pfx:
+                    raw = "."
+                    break
+                if _raw.startswith(_pfx + "/"):
+                    raw = _raw[len(_pfx) + 1:]
+                    break
+            except ValueError:
+                pass
         p = Path(raw)
         if p.is_absolute():
-            return p.resolve()
-        candidate = (self.workspace / p).resolve()
+            return self._check_read_root(p.resolve(), root)
+        own = (self.workspace / p).resolve()
+        if own.exists():
+            return self._check_read_root(own, root)
+        candidate = (root / p).resolve()
         if candidate.exists():
-            return candidate
+            return self._check_read_root(candidate, root)
         shared = (_SHARED_WORKSPACE / p).resolve()
         if shared.exists():
-            return shared
-        return candidate
+            return self._check_read_root(shared, root)
+        return self._check_read_root(own, root)
+
+    @staticmethod
+    def _check_read_root(path: Path, root: Path) -> Path:
+        try:
+            path.relative_to(root)
+            return path
+        except ValueError:
+            return root / "__denied__"
 
     def _check_write(self, path: Path) -> dict[str, Any] | None:
         try:
@@ -666,10 +737,11 @@ class MiniAgent:
         r'>\s*/dev/', r'\bmkfs\.', r'\bdd\s+if=', r'\bfdisk\b',
     ]
     _DANGEROUS_BASH_NT = [
-        r'\bdel\s+(/[fFsSqQ]\s+)*[A-Z]:[/\\]',
-        r'\brmdir\s+(/[sSqQ]\s+)*[A-Z]:[/\\]',
+        r'\bdel\s+(/[fFsSqQ]\s+)*[A-Za-z]:[/\\]',
+        r'\brmdir\s+(/[sSqQ]\s+)*[A-Za-z]:[/\\]',
         r'\bformat\b',
-        r'\bRemove-Item\s+-Recurse\s+[A-Z]:',
+        r'\bRemove-Item\s+-Recurse\s+[A-Za-z]:',
+        r'\btaskkill\b.*\b/IM\b',
     ]
     _DANGEROUS_BASH = _DANGEROUS_BASH_COMMON + (_DANGEROUS_BASH_NT if os.name == "nt" else _DANGEROUS_BASH_POSIX)
 
@@ -678,9 +750,9 @@ class MiniAgent:
         for pattern in self._DANGEROUS_BASH:
             if re.search(pattern, command) or re.search(pattern, lower):
                 return f"Command blocked: matched '{pattern}'"
-        # Block absolute paths pointing outside shared workspace.
+        # Block absolute paths pointing outside read_root.
         # Handle quoted paths (with spaces) and unquoted paths.
-        root = str(_SHARED_WORKSPACE.resolve())
+        root = str(self._read_root.resolve())
         for m in re.finditer(r'"([A-Z]:[\\/][^"]+)"|([A-Z]:[\\/]\S+)', command, re.IGNORECASE):
             p_str = m.group(1) or m.group(2)
             p = Path(p_str)
@@ -688,7 +760,7 @@ class MiniAgent:
                 if p.is_absolute():
                     rp = str(p.resolve()) if p.exists() else p_str
                     if not rp.lower().startswith(root.lower()):
-                        return f"Blocked: path '{p_str}' is outside project root"
+                        return f"Blocked: path '{p_str}' is outside read root"
             except Exception:
                 pass
         # Block Unix absolute paths (e.g. /etc/passwd) and home-directory paths (e.g. ~/secret)
@@ -702,18 +774,18 @@ class MiniAgent:
                 if p.is_absolute():
                     rp = str(p.resolve()) if p.exists() else p_str
                     if not rp.lower().startswith(root.lower()):
-                        return f"Blocked: path '{p_str}' is outside project root"
+                        return f"Blocked: path '{p_str}' is outside read root"
             except Exception:
                 pass
         for m in re.finditer(r'(~[^\s"\';&|><]*)', command):
-            return f"Blocked: home-directory path '{m.group(1)}' may access outside workspace"
-        # Block relative path traversal beyond shared workspace
+            return f"Blocked: home-directory path '{m.group(1)}' may access outside read root"
+        # Block relative path traversal beyond read_root
         for m in re.finditer(r'(\.\.[\\/])', command):
             try:
-                test = _SHARED_WORKSPACE / (m.group(0) + "x")
-                test.resolve().relative_to(_SHARED_WORKSPACE)
+                test = self._read_root / (m.group(0) + "x")
+                test.resolve().relative_to(self._read_root)
             except ValueError:
-                return f"Blocked: '..' escapes workspace root"
+                return f"Blocked: '..' escapes read root"
             except Exception:
                 pass
         # Block env-var paths that may point outside workspace
@@ -762,7 +834,7 @@ class MiniAgent:
             for f in self.workspace.rglob("*"):
                 if not f.is_file() or f.name == ".file_state.json":
                     continue
-                if ".backup" in f.parts or ".agent_outputs" in f.parts or ".trash" in f.parts:
+                if ".backup" in f.parts or ".agent_outputs" in f.parts:
                     continue
                 key = self._manifest_key(f)
                 entry = m.get(key)
@@ -800,17 +872,18 @@ class MiniAgent:
 
     def _tool_read(self, inp: dict[str, Any]) -> dict[str, Any]:
         path = self._resolve(inp["path"])
+        disp = self._rel_path(path)
         if not path.exists():
-            return {"content": f"File not found: {path}", "is_error": True}
+            return {"content": f"File not found: {disp}", "is_error": True}
         if path.is_dir():
-            return {"content": f"Path is a directory: {path}", "is_error": True}
+            return {"content": f"Path is a directory: {disp}", "is_error": True}
         fsize = path.stat().st_size
         if fsize > 500_000 and not inp.get("offset") and not inp.get("limit"):
             return {"content": f"File too large ({fsize:,} bytes). Use offset/limit.", "is_error": True}
         try:
             lines = path.read_text(encoding="utf-8").splitlines()
         except (UnicodeDecodeError, PermissionError, OSError):
-            return {"content": f"Cannot read as text: {path}", "is_error": True}
+            return {"content": f"Cannot read as text: {disp}", "is_error": True}
         offset = inp.get("offset", 0)
         limit = min(inp.get("limit", 500), 500)
         sliced = lines[offset:][:limit]
@@ -824,23 +897,31 @@ class MiniAgent:
 
     def _tool_write(self, inp: dict[str, Any]) -> dict[str, Any]:
         path = self._resolve(inp["path"])
+        disp = self._rel_path(path)
         if (err := self._check_write(path)):
             return err
+        if path.is_dir():
+            return {"content": f"Is a directory: {disp}", "is_error": True}
+        existed = path.exists()
         bak = self._backup_file(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         content = inp["content"]
         path.write_text(content, encoding="utf-8")
         m = self._load_manifest()
-        self._snapshot_file(path, m)
+        self._snapshot_file(path, m, backed=True)
         self._save_manifest(m)
-        return {"content": f"Wrote {len(content)} bytes to {path}" + (" (backed up)" if bak else ""), "is_error": False}
+        msg = f"Wrote {len(content)} bytes to {disp}" + (" (backed up)" if bak else "") + (" [overwritten]" if existed else "")
+        return {"content": msg, "is_error": False}
 
     def _tool_edit(self, inp: dict[str, Any]) -> dict[str, Any]:
         path = self._resolve(inp["path"])
+        disp = self._rel_path(path)
         if (err := self._check_write(path)):
             return err
+        if path.is_dir():
+            return {"content": f"Is a directory: {disp}", "is_error": True}
         if not path.exists():
-            return {"content": f"File not found: {path}", "is_error": True}
+            return {"content": f"File not found: {disp}", "is_error": True}
         bak = self._backup_file(path)
         text = path.read_text(encoding="utf-8")
         old, new = inp["old_string"], inp["new_string"]
@@ -855,39 +936,75 @@ class MiniAgent:
             text = text.replace(old, new, 1)
         path.write_text(text, encoding="utf-8")
         m = self._load_manifest()
-        self._snapshot_file(path, m)
+        self._snapshot_file(path, m, backed=True)
         self._save_manifest(m)
-        return {"content": f"Replaced {count} occurrence(s) in {path}" + (" (backed up)" if bak else ""), "is_error": False}
+        return {"content": f"Replaced {count} occurrence(s) in {self._rel_path(path)}" + (" (backed up)" if bak else ""), "is_error": False}
 
     def _tool_delete(self, inp: dict[str, Any]) -> dict[str, Any]:
         path = self._resolve(inp["path"])
         if (err := self._check_write(path)):
             return err
+        disp = self._rel_path(path)
         if not path.exists():
-            return {"content": f"File not found: {path}", "is_error": True}
+            return {"content": f"File not found: {disp}", "is_error": True}
         if path.is_dir():
-            return {"content": f"Path is a directory, use Bash to remove: {path}", "is_error": True}
+            return {"content": f"Path is a directory, use Bash to remove: {disp}", "is_error": True}
         bak = self._backup_file(path)
         try:
             path.unlink()
         except OSError as e:
-            return {"content": f"Failed to delete {path}: {e}", "is_error": True}
+            return {"content": f"Failed to delete {disp}: {e}", "is_error": True}
         m = self._load_manifest()
         m.pop(self._manifest_key(path), None)
         self._save_manifest(m)
-        return {"content": f"Deleted {path}" + (" (backed up)" if bak else ""), "is_error": False}
+        return {"content": f"Deleted {disp}" + (" (backed up)" if bak else ""), "is_error": False}
+
+    @staticmethod
+    def _expand_braces(pattern: str) -> list[str]:
+        """Expand {a,b,c} brace syntax into multiple patterns."""
+        m = re.search(r'\{([^{}]+)\}', pattern)
+        if not m:
+            return [pattern]
+        prefix = pattern[:m.start()]
+        suffix = pattern[m.end():]
+        results: list[str] = []
+        for opt in m.group(1).split(','):
+            expanded = prefix + opt.strip() + suffix
+            results.extend(MiniAgent._expand_braces(expanded))
+        return results
 
     def _tool_glob(self, inp: dict[str, Any]) -> dict[str, Any]:
         base = self._resolve(inp.get("path", str(self.workspace)))
         pattern = inp.get("pattern", "*")
-        matches = sorted(base.glob(pattern))
+        # Prevent .. traversal escaping read_root via glob pattern.
+        # Resolve non-wildcard prefix of pattern + base, block if outside read_root.
+        pfx = re.split(r'[*?\[\{]', pattern.replace('\\', '/'))[0]
+        if pfx and '..' in pfx:
+            try:
+                (base / pfx).resolve().relative_to(self._read_root)
+            except ValueError:
+                return {"content": f"Glob {pattern} — blocked: pattern escapes read_root", "is_error": True}
+        matches: list[Path] = []
+        for p in self._expand_braces(pattern):
+            for m in base.glob(p):
+                if self._check_read_root(m.resolve(), self._read_root).name == "__denied__":
+                    continue
+                matches.append(m)
+        matches = sorted(set(matches))
         lines: list[str] = []
         for m in matches[:200]:
             try:
-                lines.append(str(m.resolve().relative_to(self.workspace)))
+                lines.append(m.resolve().relative_to(self.workspace).as_posix())
             except ValueError:
                 lines.append(str(m))
         return {"content": f"Glob {pattern} — {len(matches)} matches\n" + "\n".join(lines), "is_error": False}
+
+    def _rel_path(self, p: Path) -> str:
+        """Display path relative to workspace, masking absolute paths."""
+        try:
+            return p.resolve().relative_to(self.workspace).as_posix()
+        except ValueError:
+            return p.name
 
     def _tool_grep(self, inp: dict[str, Any]) -> dict[str, Any]:
         pattern = inp["pattern"]
@@ -914,17 +1031,17 @@ class MiniAgent:
                 continue
             if file_glob and not fnmatch.fnmatch(p.name, file_glob):
                 continue
+            rel = self._rel_path(p)
             try:
                 for i, line in enumerate(p.read_text(encoding="utf-8", errors="ignore").split("\n"), 1):
                     if regex.search(line):
-                        key = str(p)
-                        matched_files[key] = matched_files.get(key, 0) + 1
+                        matched_files[rel] = matched_files.get(rel, 0) + 1
                         if output_mode == "content":
                             if len(results) < limit:
                                 line_text = line.rstrip()
                                 if len(line_text) > 2000:
                                     line_text = line_text[:2000] + f"... [truncated, {len(line_text)} chars]"
-                                results.append(f"{p}:{i}: {line_text}")
+                                results.append(f"{rel}:{i}: {line_text}")
                             if len(results) >= limit:
                                 content_done = True
                                 break
@@ -947,8 +1064,64 @@ class MiniAgent:
                 out = self._truncate_middle(out) + f"\n\n[Full output: {path}]"
             return {"content": out, "is_error": False}
 
+    def _tavily_keys(self) -> list[str]:
+        raw = self._provider_config.get("tavily_api_key", "") if self._provider_config else ""
+        return [k.strip() for k in raw.split("|") if k.strip()]
+
+    def _tavily_post(self, endpoint: str, payload: dict[str, Any]) -> dict[str, Any]:
+        """Call Tavily API. Tries each |-separated key, falls through on quota/rate errors."""
+        keys = self._tavily_keys()
+        if not keys:
+            return {"ok": False, "error": "No Tavily API key configured"}
+        from core.http_utils import build_httpx_client, resolve_proxy_url
+        use_proxy = self._proxy_config.get("use_for_websearch", False) if self._proxy_config else False
+        proxy_url = resolve_proxy_url({"address": self.proxy_url}) if (self.proxy_url and use_proxy) else None
+        last_err = ""
+        for api_key in keys:
+            try:
+                with build_httpx_client(proxy_url, timeout=30) as client:
+                    resp = client.post(
+                        f"https://api.tavily.com/{endpoint}",
+                        json=payload,
+                        headers={"Authorization": f"Bearer {api_key}"},
+                    )
+                    if resp.status_code == 200:
+                        return {"ok": True, "data": resp.json()}
+                    err = f"Tavily {endpoint}: HTTP {resp.status_code} — {resp.text[:200]}"
+                    if resp.status_code in (402, 429):
+                        last_err = err
+                        continue
+                    return {"ok": False, "error": err}
+            except Exception as e:
+                last_err = f"Tavily {endpoint}: {e}"
+                continue
+        return {"ok": False, "error": last_err}
+
     def _tool_websearch(self, inp: dict[str, Any]) -> dict[str, Any]:
         query = inp["query"]
+        # Try Tavily first
+        payload: dict[str, Any] = {"query": query, "max_results": 8, "search_depth": "basic"}
+        if inp.get("allowed_domains"):
+            payload["include_domains"] = inp["allowed_domains"]
+        if inp.get("blocked_domains"):
+            payload["exclude_domains"] = inp["blocked_domains"]
+        tr = self._tavily_post("search", payload)
+        if tr.get("ok"):
+            data = tr["data"]
+            results: list[str] = []
+            for r in data.get("results", [])[:8]:
+                line = f"{r.get('title', 'Untitled')}\n  {r.get('url', '')}"
+                content = r.get("content", "")
+                if content:
+                    line += f"\n  {content}"
+                results.append(line)
+            answer = data.get("answer", "")
+            if answer:
+                results.insert(0, f"[AI Answer]: {answer}")
+            if not results:
+                return {"content": f"No results for: {query}", "is_error": False}
+            return {"content": f"Search results for '{query}':\n\n" + "\n\n".join(results), "is_error": False}
+        # DuckDuckGo fallback
         url = f"https://lite.duckduckgo.com/lite/?q={urllib.parse.quote(query)}"
         opener = self._build_opener()
         try:
@@ -956,16 +1129,12 @@ class MiniAgent:
             with opener.open(req, timeout=15) as resp:
                 html_text = resp.read().decode("utf-8", errors="ignore")
         except Exception as e:
-            return {"content": f"WebSearch failed: {e}", "is_error": True}
-        results: list[str] = []
-        # Parse DuckDuckGo Lite HTML format:
-        # <a rel="nofollow" href="//duckduckgo.com/l/?uddg=..." class='result-link'>Title</a>
-        # <td class='result-snippet'>snippet</td>
+            return {"content": f"WebSearch failed: Tavily API error ({tr.get('error')}); DDG fallback error: {e}", "is_error": True}
+        results = []
         for match in re.finditer(r"<a\b[^>]*\bhref=\"([^\"]*)\"[^>]*\bclass=[\047]result-link[\047][^>]*>(.*?)</a>", html_text, re.DOTALL):
             raw_href = match.group(1)
             title = re.sub(r'<[^>]+>', '', match.group(2)).strip()
             title = html.unescape(title)
-            # Extract actual URL from DuckDuckGo redirect (uddg parameter)
             actual_url = raw_href
             parsed = urllib.parse.urlparse(raw_href if "//" in raw_href else "https:" + raw_href)
             qs = urllib.parse.parse_qs(parsed.query)
@@ -1001,6 +1170,12 @@ class MiniAgent:
             last_err = e
         if not raw:
             return {"content": f"WebFetch failed: {last_err}", "is_error": True}
+        if raw[:2] == b"\x1f\x8b":
+            import gzip
+            try:
+                raw = gzip.decompress(raw)
+            except Exception:
+                pass
         try:
             if b"text/html" in raw[:500] or raw[:200].lstrip().startswith(b"<"):
                 html = raw.decode("utf-8", errors="ignore")
@@ -1015,6 +1190,58 @@ class MiniAgent:
         if prompt:
             text = f"Content from {url}:\n\n{text}\n\n---\nPrompt: {prompt}\n\nExtract the requested information."
         return {"content": text, "is_error": False}
+
+    def _tool_tavilyextract(self, inp: dict[str, Any]) -> dict[str, Any]:
+        urls = inp["urls"]
+        payload: dict[str, Any] = {"urls": urls}
+        if inp.get("extract_depth"):
+            payload["extract_depth"] = inp["extract_depth"]
+        tr = self._tavily_post("extract", payload)
+        if not tr.get("ok"):
+            return {"content": f"TavilyExtract failed: {tr.get('error')}", "is_error": True}
+        data = tr["data"]
+        lines: list[str] = []
+        for r in data.get("results", []):
+            lines.append(f"## {r.get('title', r.get('url', 'Untitled'))}\nURL: {r.get('url', '')}\n\n{r.get('raw_content', r.get('content', ''))}")
+        failed = data.get("failed_results", [])
+        if failed:
+            lines.append(f"\n[Failed URLs: {', '.join(failed)}]")
+        text = "\n\n---\n\n".join(lines)
+        if len(text) > 12000:
+            text = text[:12000] + "\n\n[truncated at 12000 chars]"
+        return {"content": text or "(no content extracted)", "is_error": False}
+
+    def _tool_tavilycrawl(self, inp: dict[str, Any]) -> dict[str, Any]:
+        url = inp["url"]
+        payload: dict[str, Any] = {"url": url, "max_pages": inp.get("max_pages", 10)}
+        if inp.get("extract_depth"):
+            payload["extract_depth"] = inp["extract_depth"]
+        tr = self._tavily_post("crawl", payload)
+        if not tr.get("ok"):
+            return {"content": f"TavilyCrawl failed: {tr.get('error')}", "is_error": True}
+        data = tr["data"]
+        pages: list[str] = []
+        for p in data.get("pages", []):
+            pages.append(f"## {p.get('title', p.get('url', 'Untitled'))}\nURL: {p.get('url', '')}\n\n{p.get('content', p.get('raw_content', ''))}")
+        text = "\n\n---\n\n".join(pages)
+        if len(text) > 15000:
+            text = text[:15000] + "\n\n[truncated at 15000 chars]"
+        return {"content": text or "(no content)", "is_error": False}
+
+    def _tool_tavilymap(self, inp: dict[str, Any]) -> dict[str, Any]:
+        url = inp["url"]
+        payload: dict[str, Any] = {"url": url, "max_results": inp.get("max_links", 20)}
+        tr = self._tavily_post("map", payload)
+        if not tr.get("ok"):
+            return {"content": f"TavilyMap failed: {tr.get('error')}", "is_error": True}
+        data = tr["data"]
+        links = data.get("results", data.get("links", []))
+        if not links:
+            return {"content": f"No pages mapped for: {url}", "is_error": False}
+        lines = [f"Site map for {url}:\n"]
+        for link in links[:inp.get("max_links", 20)]:
+            lines.append(f"- {link}")
+        return {"content": "\n".join(lines), "is_error": False}
 
     def _build_opener(self):
         if self._web_opener is not None:
@@ -1116,6 +1343,7 @@ class MiniAgent:
         )
         sub.set_provider_config(self._provider_config)
         sub.set_proxy_config(self._proxy_config)
+        sub._read_root = self._read_root
         sub.remove_tool("SubAgent")
 
         # Run sub-agent in a thread, polling main agent's stop signal
@@ -1153,14 +1381,18 @@ class MiniAgent:
 
     def _tool_describeimage(self, inp: dict[str, Any]) -> dict[str, Any]:
         path = self._resolve(inp["path"])
+        disp = self._rel_path(path)
         if not path.exists():
-            return {"content": f"File not found: {path}", "is_error": True}
+            return {"content": f"File not found: {disp}", "is_error": True}
         if not path.is_file():
-            return {"content": f"Not a file: {path}", "is_error": True}
+            return {"content": f"Not a file: {disp}", "is_error": True}
 
         vc = self._vision_config
-        if not vc or not vc.get("api_key"):
-            return {"content": "Vision provider not configured (vision.api_key missing in settings.json)", "is_error": True}
+        providers = vc.get("providers", [])
+        if not providers and vc.get("base_url"):
+            providers = [{"base_url": vc["base_url"], "api_key": vc.get("api_key", ""), "model": vc.get("model", "GLM-4.6V-Flash")}]
+        if not providers:
+            return {"content": "Vision provider not configured (vision.providers empty in settings.json)", "is_error": True}
 
         ext = path.suffix.lower()
         mime_map = {".jpg": "jpeg", ".jpeg": "jpeg", ".png": "png", ".gif": "gif",
@@ -1176,45 +1408,55 @@ class MiniAgent:
             return {"content": f"Failed to read image: {e}", "is_error": True}
 
         prompt = inp.get("prompt", "请用中文详细描述这张图片的内容。")
-        endpoint = vc["base_url"].rstrip("/") + "/chat/completions"
-        headers = {"Authorization": f"Bearer {vc['api_key']}", "Content-Type": "application/json"}
 
         import urllib.request as _ureq
         from core.http_utils import resolve_proxy_url, build_urllib_opener
         raw_proxy = self.proxy_url or self._proxy_config.get("address", "")
         proxy_url = resolve_proxy_url({"address": raw_proxy}) if raw_proxy else None
         opener = build_urllib_opener(proxy_url) if (vc.get("use_proxy") and proxy_url) else build_urllib_opener()
-        # Use configured model first, fall back to hardcoded list
-        user_models = [m.strip() for m in (vc.get("model") or "GLM-4.6V-Flash").split(",") if m.strip()]
-        fallback = ["GLM-4.6V-Flash"]
-        models = list(dict.fromkeys(user_models + [m for m in fallback if m not in user_models]))
-        for attempt, model in enumerate(models):
-            body = {
-                "model": model, "max_tokens": 1000,
-                "messages": [{"role": "user", "content": [
-                    {"type": "image_url", "image_url": {"url": f"data:image/{mime};base64,{img_b64}"}},
-                    {"type": "text", "text": prompt},
-                ]}],
-            }
-            try:
-                req = _ureq.Request(endpoint, data=json.dumps(body).encode("utf-8"), headers=headers)
-                resp = opener.open(req, timeout=60)
-                data = json.loads(resp.read().decode("utf-8"))
-                content = data["choices"][0]["message"].get("content", "") or "(no description)"
-                return {"content": content, "is_error": False}
-            except _ureq.HTTPError as e:
-                err_body = e.read().decode("utf-8", errors="ignore")
-                code = e.code
-                is_rate_limit = code == 429 or "1305" in err_body or "1302" in err_body
-                if is_rate_limit and attempt < len(models) - 1:
-                    _time.sleep(10)
-                    continue
-                return {"content": f"Vision API error {code}: {err_body[:300]}", "is_error": True}
-            except Exception as e:
-                if attempt < len(models) - 1:
-                    _time.sleep(10)
-                    continue
-                return {"content": f"Vision API failed: {e}", "is_error": True}
+        max_tok = int(vc.get("max_tokens", 4096) or 4096)
+
+        total = sum(len([m.strip() for m in (p.get("model") or "").split(",") if m.strip()]) for p in providers)
+        attempted = 0
+        for provider in providers:
+            base_url = provider.get("base_url", "").rstrip("/")
+            api_key = provider.get("api_key", "")
+            if not base_url or not api_key:
+                attempted += len([m.strip() for m in (provider.get("model") or "").split(",") if m.strip()])
+                continue
+            endpoint = base_url + "/chat/completions"
+            models = [m.strip() for m in (provider.get("model") or "").split(",") if m.strip()]
+            for model in models:
+                body = {
+                    "model": model, "max_tokens": max_tok,
+                    "messages": [{"role": "user", "content": [
+                        {"type": "image_url", "image_url": {"url": f"data:image/{mime};base64,{img_b64}"}},
+                        {"type": "text", "text": prompt},
+                    ]}],
+                }
+                try:
+                    req = _ureq.Request(endpoint, data=json.dumps(body).encode("utf-8"),
+                                        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"})
+                    resp = opener.open(req, timeout=60)
+                    data = json.loads(resp.read().decode("utf-8"))
+                    content = data["choices"][0]["message"].get("content", "") or "(no description)"
+                    return {"content": content, "model": model, "is_error": False}
+                except _ureq.HTTPError as e:
+                    attempted += 1
+                    err_body = e.read().decode("utf-8", errors="ignore")
+                    code = e.code
+                    is_rate_limit = code == 429 or "1305" in err_body or "1302" in err_body
+                    if is_rate_limit and attempted < total:
+                        _time.sleep(2)
+                        continue
+                    if attempted >= total:
+                        return {"content": f"Vision API error {code}: {err_body[:300]}", "is_error": True}
+                    _time.sleep(2)
+                except Exception as e:
+                    attempted += 1
+                    if attempted >= total:
+                        return {"content": f"Vision API failed: {e}", "is_error": True}
+                    _time.sleep(2)
 
     # ── Conversation Cleanup ───────────────────────────────
 
@@ -1323,7 +1565,7 @@ class MiniAgent:
         for f in self.workspace.rglob("*"):
             if not f.is_file() or f.name == ".file_state.json":
                 continue
-            if ".backup" in f.parts or ".agent_outputs" in f.parts or ".trash" in f.parts:
+            if ".backup" in f.parts or ".agent_outputs" in f.parts:
                 continue
             if "ua_store" in f.parts or ".done" in f.parts:
                 continue

@@ -4,13 +4,12 @@ Layer 2 — depends on paths, fsutil, timeutil.
 """
 from __future__ import annotations
 
-import copy, hashlib, json, time as _time
+import copy, json
 from pathlib import Path
 from typing import Any
 
-from core.paths import ROOT_DIR, WORKSPACE, BACKUP_DIR as _BACKUP_DIR, LOG_DIR
+from core.paths import ROOT_DIR, WORKSPACE
 from core.fsutil import backup_file as _backup_file, atomic_write as _atomic_write
-from core.timeutil import bj_now
 
 # ── Path constants ───────────────────────────────────────
 
@@ -23,11 +22,12 @@ PLUGINS_DIR = ROOT_DIR / "config" / "plugins"
 # ── Helpers ──────────────────────────────────────────────
 
 _DEFAULT_SETTINGS: dict[str, Any] = {
-    "_version": "0.4.3",
-    "_build": "2026-06-17-fix-save",
+    "_version": "0.4.4",
+    "_build": "2026-07-10",
     "system": {"system_prompt": "", "custom_md": ""},
     "proxy": {"address": "http://127.0.0.1:7897", "use_for_api": True, "use_for_websearch": False},
-    "vision": {"use_proxy": False},
+    "tavily_api_key": "",
+    "vision": {"use_proxy": False, "max_tokens": 4096, "providers": []},
     "debug": {"enabled": False},
     "routes": [],
     "chains": [],
@@ -221,7 +221,7 @@ def save_settings(data: dict) -> dict:
     copy_data.pop("chains", None)
     if isinstance(copy_data.get("proxy"), dict):
         copy_data["proxy"].pop("use_for_plugins", None)
-    copy_data["_version"] = "0.4.3"
+    copy_data["_version"] = "0.4.4"
     return _atomic_write(SETTINGS_PATH, copy_data)
 
 

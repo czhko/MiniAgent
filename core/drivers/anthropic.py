@@ -1,7 +1,7 @@
 """Anthropic protocol driver — streaming Messages API via SDK."""
 from __future__ import annotations
 
-import os, time
+import json, os
 from typing import Any
 
 import httpx
@@ -183,6 +183,7 @@ class AnthropicDriver:
         })
 
         self._active_stream = client.messages.stream(**api_kwargs)
+        raw_events: list[dict] = []
         try:
             with self._active_stream as stream:
                 for event in stream:
@@ -190,16 +191,26 @@ class AnthropicDriver:
                         delta = event.delta
                         if hasattr(delta, "type") and delta.type == "text_delta":
                             display_text += delta.text
+                            raw_events.append({"type": "text", "delta": delta.text})
                             if on_event:
                                 on_event("text", {"delta": delta.text})
                         elif hasattr(delta, "type") and delta.type == "thinking_delta":
+                            raw_events.append({"type": "thinking", "delta": delta.thinking})
                             if on_event:
                                 on_event("thinking", {"delta": delta.thinking})
                         elif hasattr(delta, "type") and delta.type == "input_json_delta":
-                            pass
+                            raw_events.append({"type": "input_json_delta", "delta": delta.partial_json})
+                    elif hasattr(event, "type"):
+                        raw_events.append({"type": event.type})
                 final_message = stream.get_final_message()
         finally:
             self._active_stream = None
+
+        try:
+            from core.infra.raw_saver import save_raw
+            save_raw(req.model, "anthropic", [json.dumps({"events": raw_events, "content_blocks": [{"type": b.type, "text": getattr(b, "text", None), "thinking": getattr(b, "thinking", None)[:100] if hasattr(b, "thinking") else None} for b in final_message.content]}, ensure_ascii=False) + "\n"])
+        except Exception:
+            pass
 
         log_model_req("anthropic", {
             "ts": bj_epoch(), "type": "response", "status": "ok",

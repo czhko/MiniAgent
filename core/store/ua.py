@@ -1,51 +1,41 @@
 """UA (User-Assistant) pair store — hash-matched tool context recovery.
 
-from core.timeutil import bj_epoch
 Stores raw conversation blocks (thinking/tool_use/tool_result/text) keyed by
 SHA256 hash of the assistant text that OWUI will return. On the next request,
 the same hash is computed from OWUI's assistant message text → raw blocks
 are restored, giving the agent full context of previous tool calls.
 
-from core.timeutil import bj_epoch
 v2: side path blocks stored alongside main path blocks under the same hash key.
 One hash match → both main and side context restored. One hash miss → neither.
 
-from core.timeutil import bj_epoch
 Storage: config/ua_store/{hash[:2]}/{hash[2:4]}/{hash}.json
 Max entries: _MAX_FILES (oldest evicted by mtime).
 """
 from __future__ import annotations
 
-from core.timeutil import bj_epoch
-import hashlib, json, threading, time
+import hashlib, json, threading
 from pathlib import Path
 
 from core.timeutil import bj_epoch
-ROOT_DIR = Path(__file__).resolve().parent.parent
+from core.paths import ROOT_DIR
+
 UA_STORE_DIR = ROOT_DIR / "config" / "ua_store"
 
-from core.timeutil import bj_epoch
 # Safety limits
 _MAX_FILES = 100_000           # max number of stored entries
-# _TRUNCATE_TEXT removed — hash match is sufficient (SHA-256 collision prob = 0)
 _PREFIX_DEPTH = 2              # directory nesting depth (ab/cd/ef...json)
 _PREFIX_LEN = 2                # chars per directory level
 _VERSION = 2                   # v2: added "s" field for side path blocks
 
-from core.timeutil import bj_epoch
 _lock = threading.Lock()
 _backfill_done = False
 
-from core.timeutil import bj_epoch
 
-from core.timeutil import bj_epoch
 def _hash(text: str) -> str:
     """First 16 hex chars of SHA256 — enough for collision resistance."""
     return hashlib.sha256(text.encode()).hexdigest()[:16]
 
-from core.timeutil import bj_epoch
 
-from core.timeutil import bj_epoch
 def _path(h: str) -> Path:
     """Dir-prefixed path: ua_store/ab/cd/abcdef123456.json"""
     p = UA_STORE_DIR
@@ -56,16 +46,16 @@ def _path(h: str) -> Path:
         p = p / seg
     return p / f"{h}.json"
 
-from core.timeutil import bj_epoch
 
-from core.timeutil import bj_epoch
 def _write_entry(hash_key: str, data: dict) -> int:
     """Write data to ua_store under hash_key. Returns bytes written."""
     path = _path(hash_key)
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         raw = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
-        path.write_text(raw, encoding="utf-8")
+        tmp = path.with_suffix(".json.tmp")
+        tmp.write_text(raw, encoding="utf-8")
+        tmp.replace(path)
         return len(raw)
     except OSError as e:
         try:
@@ -75,9 +65,7 @@ def _write_entry(hash_key: str, data: dict) -> int:
             pass
         return 0
 
-from core.timeutil import bj_epoch
 
-from core.timeutil import bj_epoch
 def _try_load(path: Path) -> tuple:
     """Read a UA Store entry. Hash match = trust. Returns (main_blocks, side_blocks) or (None, None)."""
     try:
@@ -86,9 +74,7 @@ def _try_load(path: Path) -> tuple:
         return None, None
     return data.get("b"), data.get("s")
 
-from core.timeutil import bj_epoch
 
-from core.timeutil import bj_epoch
 def save(assistant_text: str, main_blocks: list[dict],
          side_blocks: dict[str, list[dict]] | None = None) -> None:
     """Store main_blocks (and optional side_blocks) under text hash."""
@@ -103,7 +89,11 @@ def save(assistant_text: str, main_blocks: list[dict],
     }
     if side_blocks:
         data["s"] = side_blocks
+    import re as _re
     hashes = [_hash(assistant_text)]
+    stripped = _re.sub(r"<thinking>.*?</thinking>", "", assistant_text, flags=_re.DOTALL)
+    if stripped != assistant_text:
+        hashes.append(_hash(stripped))
     if len(assistant_text) > 100:
         hashes.append(_hash(assistant_text[:100]))
         hashes.append(_hash(assistant_text[-100:]))
@@ -120,9 +110,7 @@ def save(assistant_text: str, main_blocks: list[dict],
             + f" hashes={len(hashes)}")
     _evict_oldest()
 
-from core.timeutil import bj_epoch
 
-from core.timeutil import bj_epoch
 def load(assistant_text: str) -> tuple[list[dict] | None, dict[str, list[dict]] | None]:
     """Look up (main_blocks, side_blocks) by hash.
     Returns (None, None) on miss.
@@ -141,7 +129,11 @@ def load(assistant_text: str) -> tuple[list[dict] | None, dict[str, list[dict]] 
     if not assistant_text:
         return None, None
     t0 = bj_epoch()
+    import re as _re
     candidates = [_hash(assistant_text)]
+    stripped = _re.sub(r"<thinking>.*?</thinking>", "", assistant_text, flags=_re.DOTALL)
+    if stripped != assistant_text:
+        candidates.append(_hash(stripped))
     if len(assistant_text) > 100:
         candidates.append(_hash(assistant_text[:100]))
         candidates.append(_hash(assistant_text[-100:]))
@@ -161,9 +153,7 @@ def load(assistant_text: str) -> tuple[list[dict] | None, dict[str, list[dict]] 
             f" text_len={len(assistant_text)}")
     return main_result, side_result
 
-from core.timeutil import bj_epoch
 
-from core.timeutil import bj_epoch
 def _evict_oldest() -> None:
     """Remove the oldest 10% of files when over _MAX_FILES."""
     if not UA_STORE_DIR.exists():
@@ -184,9 +174,7 @@ def _evict_oldest() -> None:
             except OSError:
                 pass
 
-from core.timeutil import bj_epoch
 
-from core.timeutil import bj_epoch
 def backfill() -> int:
     """Migrate existing entries: add head-100 and tail-100 hash symlinks.
     Called once at startup. Returns number of entries backfilled."""

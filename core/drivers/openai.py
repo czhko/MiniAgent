@@ -1,10 +1,8 @@
 """OpenAI-compatible protocol driver — streaming Chat Completions API."""
 from __future__ import annotations
 
-import json, time
+import json
 from typing import Any
-
-import httpx
 
 from core.infra.logger import log_model_req
 from core.drivers.base import ModelRequest, ModelResponse, EventFn
@@ -160,6 +158,7 @@ class OpenAIDriver:
         content_blocks: list[dict[str, Any]] = []
         tool_calls: dict[int, dict] = {}
         final_usage = {"in": 0, "out": 0, "cache_read": 0, "cache_write": 0}
+        raw_lines: list[str] = []
 
         try:
             from core.http_utils import build_httpx_client
@@ -175,6 +174,7 @@ class OpenAIDriver:
                             detail = "(could not read error body)"
                         raise RuntimeError(f"OpenAI API HTTP {resp.status_code}: {detail}")
                     for line in resp.iter_lines():
+                        raw_lines.append(line + "\n")
                         if not line.startswith("data: "):
                             continue
                         payload = line[6:]
@@ -227,6 +227,8 @@ class OpenAIDriver:
                         content = delta.get("content", "")
                         if content:
                             display_text += content
+                            from core.infra.logger import trace_log
+                            trace_log(content, dest="model_resp")
                             if on_event:
                                 on_event("text", {"delta": content})
 
@@ -254,6 +256,12 @@ class OpenAIDriver:
 
         if on_event:
             on_event("usage", dict(final_usage))
+
+        try:
+            from core.infra.raw_saver import save_raw
+            save_raw(req.model, "openai", raw_lines)
+        except Exception:
+            pass
 
         log_model_req("openai", {
             "ts": bj_epoch(), "type": "response", "status": "ok",
