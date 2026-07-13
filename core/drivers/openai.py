@@ -119,7 +119,7 @@ class OpenAIDriver:
             "stream": True,
             "stream_options": {"include_usage": True},
         }
-        if any(req.model.lower().startswith(p) for p in ("o1", "o3", "o4", "gpt-5")):
+        if any(req.model.lower().startswith(p) for p in ("o1", "o3", "o4", "gpt-")):
             body["max_completion_tokens"] = req.max_tokens
         else:
             body["max_tokens"] = req.max_tokens

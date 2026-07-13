@@ -702,7 +702,7 @@ class AdminBackend:
                 ],
             }
             _use_max_completion = any(
-                model.lower().startswith(p) for p in ("o1", "o3", "o4", "gpt-5")
+                model.lower().startswith(p) for p in ("o1", "o3", "o4", "gpt-")
             )
             if _use_max_completion:
                 req_body["max_completion_tokens"] = 50
