@@ -1,10 +1,19 @@
 """System prompt builder."""
 from __future__ import annotations
 
-import os
+import os, sys
 from pathlib import Path
 from core.paths import ROOT_DIR
 from core.timeutil import bj_now
+
+
+def _platform_name() -> str:
+    if sys.platform == "win32":
+        return "Windows"
+    if sys.platform == "darwin":
+        return "macOS"
+    return "Linux"
+
 
 SYSTEM_PROMPT_STATIC = """\
 你是一个帮助用户完成软件工程任务的交互式 Agent。根据任务需要使用可用工具，尽可能直接、准确地完成任务。
@@ -84,6 +93,6 @@ def build_system_prompt(workspace: str | Path = ".", model: str = "claude-sonnet
         f" - Model family: {family}\n"
         f" - Working directory: {workspace.relative_to(ROOT_DIR).as_posix()}\n"
         f" - Date: {date_str}\n"
-        f" - Platform: Windows" + (f"\n{shell_info}" if shell_info else "")
+        f" - Platform: {_platform_name()}" + (f"\n{shell_info}" if shell_info else "")
     )
     return "\n\n".join([SYSTEM_PROMPT_STATIC, env, custom_md]) if custom_md else "\n\n".join([SYSTEM_PROMPT_STATIC, env])
